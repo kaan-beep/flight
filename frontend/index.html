@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<title>Flight Radar - Canlı Uçuş Takibi</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body, #map { height: 100%; margin: 0; background: #0b1220; }
+  #status {
+    position: absolute; top: 10px; left: 50px; z-index: 1000;
+    background: rgba(0,0,0,0.7); color: #fff; padding: 6px 12px;
+    border-radius: 4px; font: 13px sans-serif;
+  }
+  #legend {
+    position: absolute; bottom: 20px; left: 10px; z-index: 1000;
+    background: rgba(0,0,0,0.75); color: #fff; padding: 10px 14px;
+    border-radius: 6px; font: 12px sans-serif; line-height: 1.7;
+  }
+  #legend .row { display: flex; align-items: center; gap: 8px; }
+  #legend .swatch { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+  #tooltip {
+    position: absolute; z-index: 1000; pointer-events: none;
+    background: rgba(0,0,0,0.85); color: #fff; padding: 6px 10px;
+    border-radius: 4px; font: 12px sans-serif; line-height: 1.5;
+    display: none; white-space: nowrap;
+  }
+</style>
+</head>
+<body>
+<div id="status">Bağlanıyor...</div>
+<div id="legend">
+  <div style="font-weight:bold; margin-bottom:4px;">İrtifa (ft)</div>
+  <div class="row"><span class="swatch" style="background:#8e8e93"></span>Yerde</div>
+  <div class="row"><span class="swatch" style="background:#e74c3c"></span>&lt; 5.000</div>
+  <div class="row"><span class="swatch" style="background:#e67e22"></span>5.000 - 10.000</div>
+  <div class="row"><span class="swatch" style="background:#f1c40f"></span>10.000 - 15.000</div>
+  <div class="row"><span class="swatch" style="background:#2ecc71"></span>15.000 - 20.000</div>
+  <div class="row"><span class="swatch" style="background:#3498db"></span>20.000 - 25.000</div>
+  <div class="row"><span class="swatch" style="background:#9b59b6"></span>&gt; 25.000</div>
+</div>
+<div id="tooltip"></div>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // zoomAnimation: false -- Leaflet'in animasyonlu zoom'u sırasında canvas
+  // içeriği CSS ile gerilip bozuluyordu (uçaklar garip görünüyordu). Animasyonu
+  // kapatınca harita anında yeni zoom'a geçiyor ve tek seferde temiz çiziliyor.
+  const map = L.map('map', {
+    preferCanvas: true,
+    worldCopyJump: true,
+    zoomAnimation: false,
+    markerZoomAnimation: false,
+  }).setView([39.0, 35.0], 5);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap katkıcıları',
+    maxZoom: 19,
+  }).addTo(map);
+
+  const METERS_TO_FEET = 3.28084;
+
+  function altitudeColor(altitudeM, onGround) {
+    if (onGround) return '#8e8e93';
+    const ft = (altitudeM || 0) * METERS_TO_FEET;
+    if (ft < 5000) return '#e74c3c';
+    if (ft < 10000) return '#e67e22';
+    if (ft < 15000) return '#f1c40f';
+    if (ft < 20000) return '#2ecc71';
+    if (ft < 25000) return '#3498db';
+    return '#9b59b6';
+  }
+
+  // ---- Tek canvas üzerinde binlerce uçağı çizen özel Leaflet katmanı ----
+  // (Her uçak için ayrı DOM marker'ı oluşturmak binlerce elemanla tarayıcıyı
+  //  kilitlediği için, tüm uçaklar tek bir <canvas>'a 2D API ile çizilir.)
+  const PlaneCanvasLayer = L.Layer.extend({
+    onAdd(map) {
+      this._map = map;
+      this._canvas = L.DomUtil.create('canvas', 'leaflet-plane-canvas');
+      this._ctx = this._canvas.getContext('2d');
+      map.getPanes().overlayPane.appendChild(this._canvas);
+
+      map.on('moveend zoomend resize', this._reset, this);
+      this._reset();
+    },
+    onRemove(map) {
+      L.DomUtil.remove(this._canvas);
+      map.off('moveend zoomend resize', this._reset, this);
+    },
+    _reset() {
+      const size = this._map.getSize();
+      const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+      L.DomUtil.setPosition(this._canvas, topLeft);
+      this._canvas.width = size.x;
+      this._canvas.height = size.y;
+      this.redraw();
+    },
+    redraw() {
+      if (!this._ctx) return;
+      const ctx = this._ctx;
+      const size = this._map.getSize();
+      ctx.clearRect(0, 0, size.x, size.y);
+
+      const bounds = this._map.getBounds().pad(0.15);
+      const zoom = this._map.getZoom();
+      const scale = Math.max(0.7, Math.min(1.6, zoom / 6));
+
+      // Sadece görünen uçakları çiz ve fare-üstü testi için ayrı bir
+      // listede tut (mousemove'da binlerce uçağı taramamak için).
+      visiblePoints.length = 0;
+      for (const entry of flights.values()) {
+        const f = entry.data;
+        if (f.latitude == null || f.longitude == null) continue;
+        if (!bounds.contains([f.latitude, f.longitude])) continue;
+
+        const pt = this._map.latLngToContainerPoint([f.latitude, f.longitude]);
+        entry.screenX = pt.x;
+        entry.screenY = pt.y;
+        drawPlane(ctx, pt.x, pt.y, f.heading_deg || 0, altitudeColor(f.altitude_m, f.on_ground), scale);
+        visiblePoints.push(entry);
+      }
+    },
+  });
+
+  function drawPlane(ctx, x, y, headingDeg, color, scale) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate((headingDeg * Math.PI) / 180);
+    ctx.scale(scale, scale);
+    ctx.beginPath();
+    // Basit, üstten görünüşlü uçak silüeti (burun yukarı / kuzey = 0°)
+    ctx.moveTo(0, -8);
+    ctx.lineTo(2.4, -2.5);
+    ctx.lineTo(9, 3);
+    ctx.lineTo(9, 5);
+    ctx.lineTo(2.2, 2.7);
+    ctx.lineTo(2.6, 7.5);
+    ctx.lineTo(5, 9.5);
+    ctx.lineTo(5, 11);
+    ctx.lineTo(0, 9.7);
+    ctx.lineTo(-5, 11);
+    ctx.lineTo(-5, 9.5);
+    ctx.lineTo(-2.6, 7.5);
+    ctx.lineTo(-2.2, 2.7);
+    ctx.lineTo(-9, 5);
+    ctx.lineTo(-9, 3);
+    ctx.lineTo(-2.4, -2.5);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.lineWidth = 0.8;
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // icao24 -> { data, lastSeen, screenX, screenY }
+  const flights = new Map();
+  // Son çizimde ekranda görünen uçakların listesi (hover testleri bunun üzerinde yapılır)
+  const visiblePoints = [];
+  const statusEl = document.getElementById('status');
+  const tooltipEl = document.getElementById('tooltip');
+
+  const planeLayer = new PlaneCanvasLayer();
+  planeLayer.addTo(map);
+
+  let redrawScheduled = false;
+  function scheduleRedraw() {
+    if (redrawScheduled) return;
+    redrawScheduled = true;
+    requestAnimationFrame(() => {
+      redrawScheduled = false;
+      planeLayer.redraw();
+    });
+  }
+
+  function upsertFlight(f) {
+    if (f.latitude == null || f.longitude == null) return;
+    const existing = flights.get(f.icao24);
+    flights.set(f.icao24, {
+      data: f,
+      lastSeen: Date.now(),
+      screenX: existing?.screenX,
+      screenY: existing?.screenY,
+    });
+    scheduleRedraw();
+  }
+
+  // 90 saniyedir güncellenmeyen uçakları temizle
+  setInterval(() => {
+    const cutoff = Date.now() - 90_000;
+    let removed = false;
+    for (const [icao24, entry] of flights) {
+      if (entry.lastSeen < cutoff) {
+        flights.delete(icao24);
+        removed = true;
+      }
+    }
+    if (removed) scheduleRedraw();
+  }, 15_000);
+
+  // Fare ile uçak üzerine gelince bilgi kutusu göster
+  // (yalnızca o an ekranda çizili olan uçaklar taranır, binlerce değil)
+  const mapContainer = map.getContainer();
+  let hoverPending = false;
+  let lastMouseEvent = null;
+
+  mapContainer.addEventListener('mousemove', (ev) => {
+    lastMouseEvent = ev;
+    if (hoverPending) return;
+    hoverPending = true;
+    requestAnimationFrame(handleHover);
+  });
+
+  function handleHover() {
+    hoverPending = false;
+    const ev = lastMouseEvent;
+    const rect = mapContainer.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+
+    let closest = null;
+    let closestDist = 10; // px tolerans
+    for (const entry of visiblePoints) {
+      if (entry.screenX == null) continue;
+      const dx = entry.screenX - mx;
+      const dy = entry.screenY - my;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = entry;
+      }
+    }
+
+    if (closest) {
+      const f = closest.data;
+      const label = f.callsign || f.icao24;
+      const ft = Math.round((f.altitude_m || 0) * METERS_TO_FEET);
+      const kmh = Math.round((f.velocity_ms || 0) * 3.6);
+      tooltipEl.innerHTML =
+        `<b>${label}</b><br/>${f.origin_country || ''}<br/>` +
+        `İrtifa: ${ft.toLocaleString('tr-TR')} ft &nbsp;|&nbsp; Hız: ${kmh} km/s`;
+      tooltipEl.style.left = (ev.clientX + 14) + 'px';
+      tooltipEl.style.top = (ev.clientY + 14) + 'px';
+      tooltipEl.style.display = 'block';
+      mapContainer.style.cursor = 'pointer';
+    } else {
+      tooltipEl.style.display = 'none';
+      mapContainer.style.cursor = '';
+    }
+  }
+
+  let lastStatusUpdate = 0;
+
+  function connectWebSocket() {
+    const ws = new WebSocket('ws://localhost:8765');
+
+    ws.onopen = () => { statusEl.textContent = 'Bağlandı, canlı veri bekleniyor...'; };
+
+    ws.onclose = () => {
+      statusEl.textContent = 'Bağlantı kesildi, yeniden bağlanılıyor...';
+      setTimeout(connectWebSocket, 2000);
+    };
+
+    ws.onerror = () => { ws.close(); };
+
+    ws.onmessage = (event) => {
+      const flight = JSON.parse(event.data);
+      upsertFlight(flight);
+
+      const now = Date.now();
+      if (now - lastStatusUpdate > 500) {
+        lastStatusUpdate = now;
+        statusEl.textContent =
+          `Canlı - ${new Date().toLocaleTimeString('tr-TR')} ` +
+          `(${flights.size} uçak takipte)`;
+      }
+    };
+  }
+
+  connectWebSocket();
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: producer
+  namespace: flight
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: producer }
+  template:
+    metadata:
+      labels: { app: producer }
+    spec:
+      containers:
+        - name: producer
+          image: flight-producer:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "producer.py"]
+          env:
+            - { name: KAFKA_BOOTSTRAP_SERVERS, value: "kafka.flight.svc.cluster.local:29092" }
+            - name: OPENSKY_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: opensky-credentials
+                  key: username
+                  optional: true
+            - name: OPENSKY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: opensky-credentials
+                  key: password
+                  optional: true

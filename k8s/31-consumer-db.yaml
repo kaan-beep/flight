@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: consumer-db
+  namespace: flight
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: consumer-db }
+  template:
+    metadata:
+      labels: { app: consumer-db }
+    spec:
+      containers:
+        - name: consumer-db
+          image: flight-consumer-db:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "consumer_db.py"]
+          env:
+            - { name: KAFKA_BOOTSTRAP_SERVERS, value: "kafka.flight.svc.cluster.local:29092" }
+            - { name: PG_HOST, value: "postgres.flight.svc.cluster.local" }
+            - { name: PG_PORT, value: "5432" }
+            - { name: PG_DB, value: "flightradar" }
+            - { name: PG_USER, value: "postgres" }
+            - { name: PG_PASSWORD, value: "postgres" }

@@ -1,0 +1,4 @@
+requests
+confluent-kafka
+psycopg2-binary
+websockets
