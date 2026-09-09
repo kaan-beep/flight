@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8" />
+<title>Flight Radar - Canlı Uçauş Takibi</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body, #map { height: 100%; margin: 0; background: #05070d; }
+  #map { filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.92); }
+  #map .leaflet-marker-icon, #map .leaflet-popup, #map .airport-icon {
+    filter: invert(1) hue-rotate(180deg);
+  }
+  .leaflet-plane-canvas { filter: invert(1) hue-rotate(180deg); }
+
+  #status {
+    position: absolute; top: 10px; left: 50px; z-index: 1000;
+    background: rgba(10,14,22,0.85); color: #dfe8f5; padding: 7px 14px;
+    border-radius: 6px; font: 500 13px/1.3 -apple-system, "Segoe UI", sans-serif;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  #search {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    background: rgba(10,14,22,0.85); color: #dfe8f5; padding: 7px 12px;
+    border-radius: 6px; font: 500 13px -apple-system, "Segoe UI", sans-serif;
+    border: 1px solid rgba(255,255,255,0.15); width: 220px;
+  }
+  #search::placeholder { color: #8291a0; }
+  #legend {
+    position: absolute; bottom: 20px; left: 10px; z-index: 1000;
+    background: rgba(10,14,22,0.88); color: #dfe8f5; padding: 12px 16px;
+    border-radius: 8px; font: 12px -apple-system, "Segoe UI", sans-serif; line-height: 1.7;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  #legend .title { font-weight: 600; margin-bottom: 6px; color: #fff; }
+  #legend .row { display: flex; align-items: center; gap: 8px; }
+  #legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  #legend hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 8px 0; }
+  #legend label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+  #tooltip {
+    position: absolute; z-index: 1000; pointer-events: none;
+    background: rgba(10,14,22,0.92); color: #eef3fa; padding: 8px 12px;
+    border-radius: 6px; font: 12px -apple-system, "Segoe UI", sans-serif; line-height: 1.55;
+    display: none; white-space: nowrap;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  #tooltip b { color: #7fd0ff; }
+</style>
+</head>
+<body>
+<div id="status">Bağlanıyor...</div>
+<input id="search" type="text" placeholder="Çağrı işareti ara (örn. PGT)..." />
+<div id="legend">
+  <div class="title">İrtifa (ft)</div>
+  <div class="row"><span class="swatch" style="background:#8e8e93"></span>Yerde</div>
+  <div class="row"><span class="swatch" style="background:#e74c3c"></span>&lt; 5.000</div>
+  <div class="row"><span class="swatch" style="background:#e67e22"></span>5.000 - 10.000</div>
+  <div class="row"><span class="swatch" style="background:#f1c40f"></span>10.000 - 15.000</div>
+  <div class="row"><span class="swatch" style="background:#2ecc71"></span>15.000 - 20.000</div>
+  <div class="row"><span class="swatch" style="background:#3498db"></span>20.000 - 25.000</div>
+  <div class="row"><span class="swatch" style="background:#9b59b6"></span>&gt; 25.000</div>
+  <hr>
+  <label><input type="checkbox" id="airportToggle" checked>Havalimanları</label>
+</div>
+<div id="tooltip"></div>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  // zoomAnimation: false -- Leaflet'in animasyonlu zoom'u sırasında canvas
+  // içeriği CSS ile gerilip bozuluyordu (uçaklar garip görünüyordu). Animasyonu
+  // kapatınca harita anında yeni zoom'a geçiyor ve tek seferde temiz çiziliyor.
+  const map = L.map('map', {
+    preferCanvas: true,
+    worldCopyJump: true,
+    zoomAnimation: false,
+    markerZoomAnimation: false,
+  }).setView([39.0, 35.0], 5);
+  // Not: harita CSS ile (renk tersleme) koyu temaya çevriliyor -- API anahtarı
+  // gerektiren ücretli "dark" tile sağlayıcılarına ihtiyaç duymadan.
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap katkıcıları',
+    maxZoom: 19,
+  }).addTo(map);
+
+  const METERS_TO_FEET = 3.28084;
+
+  function altitudeColor(altitudeM, onGround) {
+    if (onGround) return '#8e8e93';
+    const ft = (altitudeM || 0) * METERS_TO_FEET;
+    if (ft < 5000) return '#e74c3c';
+    if (ft < 10000) return '#e67e22';
+    if (ft < 15000) return '#f1c40f';
+    if (ft < 20000) return '#2ecc71';
+    if (ft < 25000) return '#3498db';
+    return '#9b59b6';
+  }
+
+  // OpenSky "category" alanı (ADS-B emitter kategorisi)
+  const CATEGORY_LABELS = {
+    0: 'Bilinmiyor', 1: 'Bilinmiyor', 2: 'Hafif uçak', 3: 'Küçük uçak',
+    4: 'Büyük uçak', 5: 'Büyük (yüksek girdap)', 6: 'Ağır uçak',
+    7: 'Yüksek performanslı', 8: 'Helikopter', 9: 'Süzülme aracı',
+    10: 'Hava gemisi', 11: 'Paraşüt', 12: 'Hafif spor', 13: 'İHA',
+    14: 'Uzay aracı', 15: 'Yüzey (acil)', 16: 'Yüzey (hizmet)',
+    17: 'Nokta engel', 18: 'Küme engel', 19: 'Hat engel',
+  };
+
+  // ---- Havalimanları (statik, önemli dünya hub'ları) ----
+  const AIRPORTS = [
+    ['İstanbul', 'IST', 41.2753, 28.7519], ['Londra Heathrow', 'LHR', 51.4700, -0.4543],
+    ['Paris CDG', 'CDG', 49.0097, 2.5479], ['Frankfurt', 'FRA', 50.0379, 8.5622],
+    ['Amsterdam', 'AMS', 52.3105, 4.7683], ['Madrid', 'MAD', 40.4983, -3.5676],
+    ['Roma Fiumicino', 'FCO', 41.8003, 12.2389], ['Münih', 'MUC', 48.3538, 11.7861],
+    ['Dubai', 'DXB', 25.2532, 55.3657], ['Doha', 'DOH', 25.2731, 51.6081],
+    ['Riyad', 'RUH', 24.9576, 46.6988], ['Kahire', 'CAI', 30.1219, 31.4056],
+    ['New York JFK', 'JFK', 40.6413, -73.7781], ['Atlanta', 'ATL', 33.6407, -84.4277],
+    ['Chicago O\'Hare', 'ORD', 41.9742, -87.9073], ['Los Angeles', 'LAX', 33.9416, -118.4085],
+    ['Dallas', 'DFW', 32.8998, -97.0403], ['Toronto', 'YYZ', 43.6777, -79.6248],
+    ['Mexico City', 'MEX', 19.4363, -99.0721], ['São Paulo', 'GRU', -23.4356, -46.4731],
+    ['Buenos Aires', 'EZE', -34.8222, -58.5358], ['Moskova SVO', 'SVO', 55.9726, 37.4146],
+    ['Pekin', 'PEK', 40.0799, 116.6031], ['Şangay', 'PVG', 31.1443, 121.8083],
+    ['Hong Kong', 'HKG', 22.3080, 113.9185], ['Tokyo Haneda', 'HND', 35.5494, 139.7798],
+    ['Seul Incheon', 'ICN', 37.4602, 126.4407], ['Singapur', 'SIN', 1.3644, 103.9915],
+    ['Bangkok', 'BKK', 13.6900, 100.7501], ['Delhi', 'DEL', 28.5562, 77.1000],
+    ['Mumbai', 'BOM', 19.0896, 72.8656], ['Jakarta', 'CGK', -6.1256, 106.6559],
+    ['Sidney', 'SYD', -33.9399, 151.1753], ['Johannesburg', 'JNB', -26.1392, 28.2460],
+    ['Lagos', 'LOS', 6.5774, 3.3212], ['Nairobi', 'NBO', -1.3192, 36.9278],
+    ['Atina', 'ATH', 37.9364, 23.9445], ['Viyana', 'VIE', 48.1103, 16.5697],
+    ['Zürih', 'ZRH', 47.4647, 8.5492], ['Kopenhag', 'CPH', 55.6180, 12.6560],
+    ['Oslo', 'OSL', 60.1976, 11.1004], ['Varşova', 'WAW', 52.1657, 20.9671],
+    ['Bükreş', 'OTP', 44.5711, 26.0850],
+    ['Bakü', 'GYD', 40.4675, 50.0467], ['Almatı', 'ALA', 43.3521, 77.0405],
+  ];
+
+  const airportIcon = L.divIcon({
+    className: 'airport-icon',
+    html: '<div style="width:8px;height:8px;border-radius:50%;background:#ffb020;border:1.5px solid #402400;box-shadow:0 0 4px rgba(255,176,32,0.8);"></div>',
+    iconSize: [8, 8],
+    iconAnchor: [4, 4],
+  });
+
+  const airportLayer = L.layerGroup(
+    AIRPORTS.map(([name, iata, lat, lon]) =>
+      L.marker([lat, lon], { icon: airportIcon }).bindPopup(`<b>${name}</b> (${iata})`)
+    )
+  ).addTo(map);
+
+  document.getElementById('airportToggle').addEventListener('change', (ev) => {
+    if (ev.target.checked) airportLayer.addTo(map);
+    else map.removeLayer(airportLayer);
+  });
+
+  // ---- Tek canvas üzerinde binlerce uçağı çizen özel Leaflet katmanı ----
+  // (Her uçak için ayrı DOM marker'ı oluşturmak binlerce elemanla tarayıcıyı
+  //  kilitlediği için, tüm uçaklar tek bir <canvas>'a 2D API ile çizilir.)
+  const PlaneCanvasLayer = L.Layer.extend({
+    onAdd(map) {
+      this._map = map;
+      this._canvas = L.DomUtil.create('canvas', 'leaflet-plane-canvas');
+      this._ctx = this._canvas.getContext('2d');
+      map.getPanes().overlayPane.appendChild(this._canvas);
+
+      map.on('moveend zoomend resize', this._reset, this);
+      this._reset();
+    },
+    onRemove(map) {
+      L.DomUtil.remove(this._canvas);
+      map.off('moveend zoomend resize', this._reset, this);
+    },
+    _reset() {
+      const size = this._map.getSize();
+      const topLeft = this._map.containerPointToLayerPoint([0, 0]);
+      L.DomUtil.setPosition(this._canvas, topLeft);
+      this._canvas.width = size.x;
+      this._canvas.height = size.y;
+      this.redraw();
+    },
+    redraw() {
+      if (!this._ctx) return;
+      const ctx = this._ctx;
+      const size = this._map.getSize();
+      ctx.clearRect(0, 0, size.x, size.y);
+
+      const bounds = this._map.getBounds().pad(0.15);
+      const zoom = this._map.getZoom();
+      const scale = Math.max(1.1, Math.min(2.4, zoom / 4.2));
+
+      // Sadece görünen uçakları çiz ve fare-üstü testi için ayrı bir
+      // listede tut (mousemove'da binlerce uçağı taramamak için).
+      visiblePoints.length = 0;
+      for (const entry of flights.values()) {
+        const f = entry.data;
+        if (f.latitude == null || f.longitude == null) continue;
+        if (!bounds.contains([f.latitude, f.longitude])) continue;
+
+        const pt = this._map.latLngToContainerPoint([f.latitude, f.longitude]);
+        entry.screenX = pt.x;
+        entry.screenY = pt.y;
+
+        // Arama kutusuna bir şey yazılmışsa: eşleşmeyen uçaklar soluklaşır
+        const eslesiyor = !searchText || (f.callsign || '').toUpperCase().includes(searchText);
+        const opaklik = eslesiyor ? 1 : 0.15;
+
+        drawPlane(ctx, pt.x, pt.y, f.heading_deg || 0, altitudeColor(f.altitude_m, f.on_ground), scale, opaklik);
+        visiblePoints.push(entry);
+      }
+    },
+  });
+
+  function drawPlane(ctx, x, y, headingDeg, color, scale, opaklik = 1) {
+    ctx.save();
+    ctx.globalAlpha = opaklik;
+    ctx.translate(x, y);
+    ctx.rotate((headingDeg * Math.PI) / 180);
+    ctx.scale(scale, scale);
+    ctx.beginPath();
+    // Basit, üstten görünüşlü uçak silüeti (burun yukarı / kuzey = 0°)
+    ctx.moveTo(0, -8);
+    ctx.lineTo(2.4, -2.5);
+    ctx.lineTo(9, 3);
+    ctx.lineTo(9, 5);
+    ctx.lineTo(2.2, 2.7);
+    ctx.lineTo(2.6, 7.5);
+    ctx.lineTo(5, 9.5);
+    ctx.lineTo(5, 11);
+    ctx.lineTo(0, 9.7);
+    ctx.lineTo(-5, 11);
+    ctx.lineTo(-5, 9.5);
+    ctx.lineTo(-2.6, 7.5);
+    ctx.lineTo(-2.2, 2.7);
+    ctx.lineTo(-9, 5);
+    ctx.lineTo(-9, 3);
+    ctx.lineTo(-2.4, -2.5);
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.lineWidth = 0.9;
+    ctx.fill();
+    ctx.stroke();
+
+    // Gövde üzerinde ince bir vurgu çizgisi -- daha "gerçek" görünmesi için
+    ctx.beginPath();
+    ctx.moveTo(0, -6);
+    ctx.lineTo(0, 9);
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 0.6;
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  // icao24 -> { data, lastSeen, screenX, screenY }
+  const flights = new Map();
+  // Son çizimde ekranda görünen uçakların listesi (hover testleri bunun üzerinde yapılır)
+  const visiblePoints = [];
+  const statusEl = document.getElementById('status');
+  const tooltipEl = document.getElementById('tooltip');
+  const searchEl = document.getElementById('search');
+  let searchText = '';
+
+  const planeLayer = new PlaneCanvasLayer();
+  planeLayer.addTo(map);
+
+  // addEventListener: kullanıcı arama kutusuna her harf yazdığında çalışır
+  searchEl.addEventListener('input', (ev) => {
+    searchText = ev.target.value.trim().toUpperCase();
+    scheduleRedraw();
+  });
+
+  let redrawScheduled = false;
+  function scheduleRedraw() {
+    if (redrawScheduled) return;
+    redrawScheduled = true;
+    requestAnimationFrame(() => {
+      redrawScheduled = false;
+      planeLayer.redraw();
+    });
+  }
+
+  function upsertFlight(f) {
+    if (f.latitude == null || f.longitude == null) return;
+    const existing = flights.get(f.icao24);
+    flights.set(f.icao24, {
+      data: f,
+      lastSeen: Date.now(),
+      screenX: existing?.screenX,
+      screenY: existing?.screenY,
+    });
+    scheduleRedraw();
+  }
+
+  // 90 saniyedir güncellenmeyen uçakları temizle
+  setInterval(() => {
+    const cutoff = Date.now() - 90_000;
+    let removed = false;
+    for (const [icao24, entry] of flights) {
+      if (entry.lastSeen < cutoff) {
+        flights.delete(icao24);
+        removed = true;
+      }
+    }
+    if (removed) scheduleRedraw();
+  }, 15_000);
+
+  // Fare ile uçak üzerine gelince bilgi kutusu göster
+  // (yalnızca o an ekranda çizili olan uçaklar taranır, binlerce değil)
+  const mapContainer = map.getContainer();
+  let hoverPending = false;
+  let lastMouseEvent = null;
+
+  mapContainer.addEventListener('mousemove', (ev) => {
+    lastMouseEvent = ev;
+    if (hoverPending) return;
+    hoverPending = true;
+    requestAnimationFrame(handleHover);
+  });
+
+  function handleHover() {
+    hoverPending = false;
+    const ev = lastMouseEvent;
+    const rect = mapContainer.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+
+    let closest = null;
+    let closestDist = 10; // px tolerans
+    for (const entry of visiblePoints) {
+      if (entry.screenX == null) continue;
+      const dx = entry.screenX - mx;
+      const dy = entry.screenY - my;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = entry;
+      }
+    }
+
+    if (closest) {
+      const f = closest.data;
+      const label = f.callsign || f.icao24;
+      const ft = Math.round((f.altitude_m || 0) * METERS_TO_FEET);
+      const kmh = Math.round((f.velocity_ms || 0) * 3.6);
+      const category = CATEGORY_LABELS[f.category] || 'Bilinmiyor';
+      tooltipEl.innerHTML =
+        `<b>${label}</b><br/>${f.origin_country || ''}<br/>` +
+        `Tip: ${category}<br/>` +
+        `İrtifa: ${ft.toLocaleString('tr-TR')} ft &nbsp;|&nbsp; Hız: ${kmh} km/s<br/>` +
+        `ICAO24: ${f.icao24}`;
+      tooltipEl.style.left = (ev.clientX + 14) + 'px';
+      tooltipEl.style.top = (ev.clientY + 14) + 'px';
+      tooltipEl.style.display = 'block';
+      mapContainer.style.cursor = 'pointer';
+    } else {
+      tooltipEl.style.display = 'none';
+      mapContainer.style.cursor = '';
+    }
+  }
+
+  let lastStatusUpdate = 0;
+
+  function connectWebSocket() {
+    const ws = new WebSocket('ws://localhost:8765');
+
+    ws.onopen = () => { statusEl.textContent = 'Bağlandı, canlı veri bekleniyor...'; };
+
+    ws.onclose = () => {
+      statusEl.textContent = 'Bağlantı kesildi, yeniden bağlanılıyor...';
+      setTimeout(connectWebSocket, 2000);
+    };
+
+    ws.onerror = () => { ws.close(); };
+
+    ws.onmessage = (event) => {
+      const flight = JSON.parse(event.data);
+      upsertFlight(flight);
+
+      const now = Date.now();
+      if (now - lastStatusUpdate > 500) {
+        lastStatusUpdate = now;
+        statusEl.textContent =
+          `Canlı - ${new Date().toLocaleTimeString('tr-TR')} ` +
+          `(${flights.size} uçak takipte)`;
+      }
+    };
+  }
+
+  connectWebSocket();
+</script>
+</body>
+</html>

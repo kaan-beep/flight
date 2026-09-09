@@ -1,0 +1,100 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: flight-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: flightradar
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: flight-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: flight-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  app:
+    build: .
+    container_name: flight-app
+    restart: unless-stopped
+    command: ["python", "app.py"]
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_DB: flightradar
+      PG_USER: postgres
+      PG_PASSWORD: postgres
+      KAFKA_BROKER: kafka:29092
+      KAFKA_TOPIC: flights
+      OPENSKY_USERNAME: ${OPENSKY_USERNAME}
+      OPENSKY_PASSWORD: ${OPENSKY_PASSWORD}
+    ports:
+      - "8765:8765"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  frontend:
+    build: ./frontend
+    container_name: flight-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - app
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+volumes:
+  pg_data:

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flight-radar-config
+  namespace: flight-radar
+data:
+  PG_HOST: "postgres-service"
+  PG_PORT: "5432"
+  PG_DB: "flightradar"
+  PG_USER: "postgres"
+  KAFKA_BROKER: "kafka-service:9092"
+  KAFKA_TOPIC: "flights"
+  OPENSKY_USERNAME: ""
+  OPENSKY_PASSWORD: ""
