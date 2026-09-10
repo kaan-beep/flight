@@ -161,6 +161,43 @@ def connect_with_retry(delay_seconds: float = 3.0):
             time.sleep(delay_seconds)
 
 
+async def connect_kafka_producer_with_retry(bootstrap_servers: str, delay_seconds: float = 3.0):
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            producer = AIOKafkaProducer(bootstrap_servers=bootstrap_servers)
+            await producer.start()
+            return producer
+        except Exception as exc:
+            print(f"Kafka Producer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
+            await asyncio.sleep(delay_seconds)
+
+
+async def connect_kafka_consumer_with_retry(
+    topic: str, bootstrap_servers: str, delay_seconds: float = 3.0
+):
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            consumer = AIOKafkaConsumer(
+                topic,
+                bootstrap_servers=bootstrap_servers,
+                auto_offset_reset='earliest',
+                group_id='flight-radar-consumer',
+                session_timeout_ms=30000,
+                heartbeat_interval_ms=10000,
+                max_poll_interval_ms=300000,
+                enable_auto_commit=True,
+            )
+            await consumer.start()
+            return consumer
+        except Exception as exc:
+            print(f"Kafka Consumer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
+            await asyncio.sleep(delay_seconds)
+
+
 # ---------------------------------------------------------------------------
 # 3) Kafka ile mesaj hareketi
 # ---------------------------------------------------------------------------
@@ -218,23 +255,26 @@ async def fetch_loop(loop: asyncio.AbstractEventLoop, conn, producer: AIOKafkaPr
 
 async def kafka_consumer_task(consumer: AIOKafkaConsumer) -> None:
     """Kafka'dan oku ve WebSocket istemcilerine gönder"""
-    async for message in consumer:
-        try:
-            flight = json.loads(message.value.decode("utf-8"))
-            if not connected_clients:
-                continue
+    try:
+        async for message in consumer:
+            try:
+                flight = json.loads(message.value.decode("utf-8"))
+                if not connected_clients:
+                    continue
 
-            stale = []
-            for client in list(connected_clients):
-                try:
-                    await client.send(json.dumps(flight))
-                except ConnectionClosed:
-                    stale.append(client)
+                stale = []
+                for client in list(connected_clients):
+                    try:
+                        await client.send(json.dumps(flight))
+                    except ConnectionClosed:
+                        stale.append(client)
 
-            for client in stale:
-                connected_clients.discard(client)
-        except Exception as exc:
-            print(f"Kafka mesajı işlenirken hata: {exc}", file=sys.stderr)
+                for client in stale:
+                    connected_clients.discard(client)
+            except Exception as exc:
+                print(f"Kafka mesajı işlenirken hata: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Kafka Consumer bağlantı hatası: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -248,18 +288,11 @@ async def main() -> None:
     print("PostgreSQL hazır.")
 
     # Kafka Producer
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA_BROKER)
-    await producer.start()
+    producer = await connect_kafka_producer_with_retry(KAFKA_BROKER)
     print(f"Kafka Producer başladı: {KAFKA_BROKER}")
 
     # Kafka Consumer
-    consumer = AIOKafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=KAFKA_BROKER,
-        auto_offset_reset='earliest',
-        group_id='flight-radar-consumer',
-    )
-    await consumer.start()
+    consumer = await connect_kafka_consumer_with_retry(KAFKA_TOPIC, KAFKA_BROKER)
     print(f"Kafka Consumer başladı: {KAFKA_TOPIC}")
 
     loop = asyncio.get_running_loop()

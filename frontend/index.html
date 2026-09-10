@@ -360,9 +360,14 @@
   let lastStatusUpdate = 0;
 
   function connectWebSocket() {
-    const ws = new WebSocket('ws://localhost:8765');
+    // Docker'da backend hostname'i çözmek için otomatik detect
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.hostname;
+    const backendHost = host === 'localhost' || host === '127.0.0.1' ? 'localhost' : 'app';
+    const wsUrl = `${protocol}//${backendHost}:8765`;
+    const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => { statusEl.textContent = 'Bağlandı, canlı veri bekleniyor...'; };
+    ws.onopen = () => { statusEl.textContent = `Bağlandı (${wsUrl}), canlı veri bekleniyor...`; };
 
     ws.onclose = () => {
       statusEl.textContent = 'Bağlantı kesildi, yeniden bağlanılıyor...';
