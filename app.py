@@ -25,36 +25,72 @@ from websockets.exceptions import ConnectionClosed
 from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
 # ---------------------------------------------------------------------------
-# Ayarlar
+# Ayarlar (Environment + Constants)
 # ---------------------------------------------------------------------------
 
+# OpenSky Network API endpoint - 4000-5000 uçak bilgisi her çağrıda
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
+
+# API polling aralığı (saniye) - Rate limit yüzünden 25s minimum
 POLL_INTERVAL_SECONDS = 25
+
+# Rate limit (429) hatası aldığında bekleme süresi
 RATE_LIMIT_BACKOFF_SECONDS = 120
-WS_HOST = "0.0.0.0"
-WS_PORT = 8765
 
-KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "flights")
+# WebSocket sunucusu - Frontend bağlantısı
+WS_HOST = "0.0.0.0"  # Tüm arayüzler üzerinde dinle
+WS_PORT = 8765       # ws://localhost:8765
 
-REGION_BBOX = (25.0, -12.0, 60.0, 55.0)  # (lamin, lomin, lamax, lomax)
+# Kafka konfigürasyonu - Docker Compose'da "app" servisi Kafka'ya bağlanır
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")  # bootstrap.servers
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "flights")            # Mesaj topic'i
 
+# Coğrafi sınır - Sadece Türkiye + komşu ülkeler
+# (lamin=25.0=min latitude, lomin=-12.0=min longitude, lamax=60.0=max lat, lomax=55.0=max lon)
+REGION_BBOX = (25.0, -12.0, 60.0, 55.0)
+
+# PostgreSQL Tablo Şeması - Tüm uçuş verilerini saklar
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS flight_states (
+    -- Benzersiz kayıt ID'si
     id              BIGSERIAL PRIMARY KEY,
+
+    -- ICAO 24-bit uçak tanımlayıcısı (ör: a00001)
     icao24          VARCHAR(10) NOT NULL,
+
+    -- Çağrı işareti - Uçak registration (ör: PGT, THY123)
     callsign        VARCHAR(20),
+
+    -- Uçağın tescil edildiği ülke
     origin_country  VARCHAR(100),
+
+    -- GPS koordinatları (dereceler)
     longitude       DOUBLE PRECISION,
     latitude        DOUBLE PRECISION,
+
+    -- Barometrik irtifa (metre)
     altitude_m      DOUBLE PRECISION,
+
+    -- Yerde mi uçuşta mı
     on_ground       BOOLEAN,
+
+    -- Hız (metre/saniye)
     velocity_ms     DOUBLE PRECISION,
+
+    -- Başlık yönü (derece, 0-360)
     heading_deg     DOUBLE PRECISION,
+
+    -- Dikey hız (metre/saniye, += tırmanış, -= iniş)
     vertical_rate_ms DOUBLE PRECISION,
+
+    -- Kayıt zamanı (otomatik şu anki zaman)
     recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- İndeks: ICAO24 ile hızlı arama (her 25 saniye aynı uçağı güncellerken)
 CREATE INDEX IF NOT EXISTS idx_flight_states_icao24 ON flight_states (icao24);
+
+-- İndeks: Tarih aralığında arama (geçmiş veriler sorgulamak için)
 CREATE INDEX IF NOT EXISTS idx_flight_states_recorded_at ON flight_states (recorded_at);
 """
 
@@ -73,41 +109,72 @@ connected_clients: set = set()
 # ---------------------------------------------------------------------------
 
 def fetch_states(bbox: tuple[float, float, float, float] | None = None) -> list[dict]:
+    """
+    OpenSky Network API'den canlı uçuş verilerini çek.
+
+    Args:
+        bbox: (min_lat, min_lon, max_lat, max_lon) - coğrafi sınırlar
+              None ise tüm dünya
+
+    Returns:
+        Uçak objeleri listesi [{"icao24": ..., "callsign": ..., ...}, ...]
+
+    Raises:
+        requests.HTTPError: API hatası (401=auth, 429=rate limit, 503=server down)
+    """
     params = {}
+
+    # Bounding box filtresi - sadece Türkiye + komşu bölge
     if bbox:
         lamin, lomin, lamax, lomax = bbox
         params.update(lamin=lamin, lomin=lomin, lamax=lamax, lomax=lomax)
 
+    # Kimlik doğrulama - Premium özellikler ve yüksek rate limit için
     auth = None
     username = os.getenv("OPENSKY_USERNAME")
     password = os.getenv("OPENSKY_PASSWORD")
     if username and password:
-        auth = (username, password)
+        auth = (username, password)  # HTTP Basic Auth
 
+    # HTTP isteği - timeout 15s çünkü 4000+ uçak büyük yanıt olabilir
     response = requests.get(OPENSKY_URL, params=params, auth=auth, timeout=15)
-    response.raise_for_status()
+    response.raise_for_status()  # 4xx/5xx hataları exception fırlat
     payload = response.json()
 
+    # JSON içinden "states" dizisini çıkar (4000-5000 uçak)
     states = payload.get("states") or []
+
+    # Her raw state'i okunabilir dict'e dönüştür
     return [parse_state(state) for state in states]
 
 
 def parse_state(state: list) -> dict:
-    """OpenSky'nin ham state vector dizisini okunabilir bir sözlüğe çevirir."""
+    """
+    OpenSky API'nin "state vector" liste formatını JSON dict'e dönüştür.
+
+    OpenSky API state array index'leri:
+    [0]=icao24, [1]=callsign, [2]=origin_country, [3]=time_position,
+    [4]=last_contact, [5]=longitude, [6]=latitude, [7]=baro_altitude,
+    [8]=on_ground, [9]=velocity, [10]=true_track, [11]=vertical_rate,
+    [12]=sensors, [13]=geo_altitude, [14]=squawk, [15]=spi,
+    [16]=position_source, [17]=category
+
+    Çıktı: Frontend'in anlayacağı JSON formatında uçak verisi
+    """
     return {
-        "icao24": state[0],
-        "callsign": (state[1] or "").strip(),
-        "origin_country": state[2],
-        "longitude": state[5],
-        "latitude": state[6],
-        "altitude_m": state[7],
-        "on_ground": state[8],
-        "velocity_ms": state[9],
-        "heading_deg": state[10],
-        "vertical_rate_ms": state[11],
-        "squawk": state[14] if len(state) > 14 else None,
-        "category": state[17] if len(state) > 17 else 0,
-        "timestamp": int(time.time()),
+        "icao24": state[0],                              # Uçak kimliği
+        "callsign": (state[1] or "").strip(),            # Uçuş numarası
+        "origin_country": state[2],                      # Ülke
+        "longitude": state[5],                           # X koordinat
+        "latitude": state[6],                            # Y koordinat
+        "altitude_m": state[7],                          # Yükseklik
+        "on_ground": state[8],                           # Yerde mi
+        "velocity_ms": state[9],                         # Hız
+        "heading_deg": state[10],                        # Yön (0-360)
+        "vertical_rate_ms": state[11],                   # Dikey hız (± hızı)
+        "squawk": state[14] if len(state) > 14 else None,  # Acil kodu
+        "category": state[17] if len(state) > 17 else 0,   # Uçak tipi
+        "timestamp": int(time.time()),                   # Sunucu zamanı
     }
 
 
@@ -116,8 +183,9 @@ def parse_state(state: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_connection():
+    """PostgreSQL'e bağlan - docker-compose env vars'dan config oku."""
     return psycopg2.connect(
-        host=os.getenv("PG_HOST", "localhost"),
+        host=os.getenv("PG_HOST", "localhost"),      # Docker: "postgres" container name
         port=os.getenv("PG_PORT", "5432"),
         dbname=os.getenv("PG_DB", "flightradar"),
         user=os.getenv("PG_USER", "postgres"),
@@ -126,15 +194,31 @@ def get_connection():
 
 
 def init_db(conn) -> None:
+    """Tablo ve index'leri oluştur (ilk çalışmada)."""
     with conn.cursor() as cur:
         cur.execute(CREATE_TABLE_SQL)
     conn.commit()
+    print("✅ PostgreSQL schema hazır")
 
 
 def insert_flights(conn, flights: list[dict]) -> int:
+    """
+    Batch insert - 4000+ uçak kaydını bir SQL sorgusuyla yaz.
+
+    Avantaj: her uçak için ayrı INSERT yapmak yerine tek sorguyla hepsi
+    Performance: 4000 flights ≈ 100ms vs 4000*INSERT ≈ 10s
+
+    Args:
+        conn: PostgreSQL bağlantısı
+        flights: [{"icao24": ..., "callsign": ..., ...}, ...] list
+
+    Returns:
+        Kaç satır eklendi
+    """
     if not flights:
         return 0
 
+    # List of tuples format'ında hazırla - execute_values bu format'ı bekliyor
     rows = [
         (
             f["icao24"], f["callsign"], f["origin_country"], f["longitude"],
@@ -144,6 +228,8 @@ def insert_flights(conn, flights: list[dict]) -> int:
         for f in flights
     ]
 
+    # execute_values: Tek SQL statement'te tüm rows'ları INSERT et
+    # Örnek: INSERT INTO ... VALUES (row1), (row2), (row3), ...
     with conn.cursor() as cur:
         execute_values(cur, INSERT_SQL, rows)
     conn.commit()
@@ -151,32 +237,79 @@ def insert_flights(conn, flights: list[dict]) -> int:
 
 
 def connect_with_retry(delay_seconds: float = 3.0):
+    """
+    PostgreSQL'e bağlan - başarılı olana kadar retry et.
+
+    Docker başladığında Postgres hemen hazır olmayabilir (5-10 saniye sürebilir).
+    Bu fonksiyon backend'in PostgreSQL'e bağlanmasını garantiler.
+
+    Args:
+        delay_seconds: Retry aralığı (saniye)
+
+    Returns:
+        Bağlı PostgreSQL connection
+    """
     attempt = 0
     while True:
         attempt += 1
         try:
-            return get_connection()
+            conn = get_connection()
+            print(f"✅ PostgreSQL bağlantı başarılı (deneme {attempt})")
+            return conn
         except Exception as exc:
-            print(f"PostgreSQL'e bağlanılamadı (deneme {attempt}): {exc}", file=sys.stderr)
+            print(f"⏳ PostgreSQL'e bağlanılamadı (deneme {attempt}): {exc}", file=sys.stderr)
             time.sleep(delay_seconds)
 
 
 async def connect_kafka_producer_with_retry(bootstrap_servers: str, delay_seconds: float = 3.0):
+    """
+    Kafka Producer'a bağlan - başarılı olana kadar retry et.
+
+    Docker başlanırken Kafka hemen hazır olmayabilir.
+    Bu fonksiyon Broker hazır olana kadar bekler.
+
+    Args:
+        bootstrap_servers: "kafka:9092" (Docker) ya da "localhost:9092" (local)
+        delay_seconds: Retry aralığı (3 saniye)
+
+    Returns:
+        Bağlı Kafka producer instance
+    """
     attempt = 0
     while True:
         attempt += 1
         try:
             producer = AIOKafkaProducer(bootstrap_servers=bootstrap_servers)
             await producer.start()
+            print(f"✅ Kafka Producer başarıyla bağlandı (deneme {attempt})")
             return producer
         except Exception as exc:
-            print(f"Kafka Producer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
+            print(f"⏳ Kafka Producer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
             await asyncio.sleep(delay_seconds)
 
 
 async def connect_kafka_consumer_with_retry(
     topic: str, bootstrap_servers: str, delay_seconds: float = 3.0
 ):
+    """
+    Kafka Consumer'a bağlan - başarılı olana kadar retry et.
+
+    Consumer group'lar topic'i offset'ten okurlar. Eğer offset kaydedilmişse,
+    missed messages'ı replay edebiliriz.
+
+    Session management ayarları:
+    - session_timeout_ms=30000: Consumer 30s cevap vermezse group'tan çıkar
+    - heartbeat_interval_ms=10000: Her 10s'de heartbeat gönder (alive signal)
+    - max_poll_interval_ms=300000: Mesaj işlerken max 5 dakika alabilir
+
+    Args:
+        topic: "flights" (Kafka topic name)
+        bootstrap_servers: "kafka:9092"
+        delay_seconds: Retry aralığı
+
+    Returns:
+        Bağlı Kafka consumer instance
+    """
     attempt = 0
     while True:
         attempt += 1
@@ -184,17 +317,18 @@ async def connect_kafka_consumer_with_retry(
             consumer = AIOKafkaConsumer(
                 topic,
                 bootstrap_servers=bootstrap_servers,
-                auto_offset_reset='earliest',
-                group_id='flight-radar-consumer',
-                session_timeout_ms=30000,
-                heartbeat_interval_ms=10000,
-                max_poll_interval_ms=300000,
-                enable_auto_commit=True,
+                auto_offset_reset='earliest',        # Topic'e yeni gelişte en başından oku
+                group_id='flight-radar-consumer',    # Consumer group - rebalancing için
+                session_timeout_ms=30000,            # Heartbeat timeout
+                heartbeat_interval_ms=10000,         # Heartbeat frequency
+                max_poll_interval_ms=300000,         # Max processing time
+                enable_auto_commit=True,             # Offset'i otomatik commit et
             )
             await consumer.start()
+            print(f"✅ Kafka Consumer başarıyla bağlandı (deneme {attempt})")
             return consumer
         except Exception as exc:
-            print(f"Kafka Consumer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
+            print(f"⏳ Kafka Consumer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
             await asyncio.sleep(delay_seconds)
 
 
@@ -203,11 +337,31 @@ async def connect_kafka_consumer_with_retry(
 # ---------------------------------------------------------------------------
 
 async def produce_to_kafka(producer: AIOKafkaProducer, flights: list[dict]) -> None:
-    """Uçak verilerini Kafka'ya yazıncı olarak gönder"""
+    """
+    Tüm uçak verilerini Kafka topic'ine gönder.
+
+    Her uçak = 1 Kafka mesaj
+    Format: JSON string, UTF-8 encoded
+
+    Kafka broker tüm mesajları "flights" topic'ine yazar,
+    consumer group'lar onları okuyarak Frontend'e yayınlar.
+
+    Args:
+        producer: Async Kafka producer instance
+        flights: [{"icao24": ..., "callsign": ..., ...}, ...]
+
+    Note:
+        send_and_wait: Kafka broker'a yazıldığını bekle (ack=all)
+        Async loop'ta güvenli çalışır
+    """
     for flight in flights:
+        # JSON serialize + UTF-8 byte'a dönüştür
+        message = json.dumps(flight).encode("utf-8")
+
+        # Kafka'ya gönder - Broker cevap verene kadar bekle
         await producer.send_and_wait(
-            KAFKA_TOPIC,
-            json.dumps(flight).encode("utf-8")
+            KAFKA_TOPIC,          # Topic name: "flights"
+            message                # Byte content: b'{"icao24":"a00001",...}'
         )
 
 
@@ -216,16 +370,31 @@ async def produce_to_kafka(producer: AIOKafkaProducer, flights: list[dict]) -> N
 # ---------------------------------------------------------------------------
 
 async def handle_client(websocket) -> None:
+    """
+    Yeni WebSocket istemcisini kayıt et.
+
+    Frontend'in ws://localhost:8765'e bağlanması bu handler'ı çağırır.
+    Istemci bağlı kaldığı sürece mesajları consume_from_kafka'dan alır.
+
+    Args:
+        websocket: WebSocket connection object (asyncio.Protocol)
+    """
+    # Global set'e ekle - mesaj gönderirken tüm clients'a ulaşmak için
     connected_clients.add(websocket)
-    print(f"Yeni istemci bağlandı. Toplam: {len(connected_clients)}")
+    print(f"✅ Yeni WebSocket client bağlandı. Toplam: {len(connected_clients)}")
+
     try:
+        # Istemci bağlı kaldığı sürece mesajları yok sayıp dinle
+        # (Frontend veri göndermez, sadece alır - bu loop bağlantıyı açık tutar)
         async for _ in websocket:
             pass
     except ConnectionClosed:
+        # Normal kapanış
         pass
     finally:
+        # Client kapandı - set'ten çıkar
         connected_clients.discard(websocket)
-        print(f"İstemci ayrıldı. Toplam: {len(connected_clients)}")
+        print(f"❌ WebSocket client ayrıldı. Toplam: {len(connected_clients)}")
 
 
 # ---------------------------------------------------------------------------
@@ -233,48 +402,113 @@ async def handle_client(websocket) -> None:
 # ---------------------------------------------------------------------------
 
 async def fetch_loop(loop: asyncio.AbstractEventLoop, conn, producer: AIOKafkaProducer) -> None:
-    """OpenSky'dan veri çek → DB'ye kaydet → Kafka'ya gönder"""
+    """
+    Ana uçuş veri çekme ve işleme döngüsü.
+
+    Her 25 saniye:
+    1. OpenSky API'den ~4200 uçak bilgisi çek
+    2. PostgreSQL'e kaydedebilmek için parse et
+    3. Kafka producer'a gönder (Frontend'e yayınlanması için)
+    4. Hata varsa (rate limit, network) retry et
+
+    Rate limiting: OpenSky free tier = 1 request/10 saniye
+                  Premium tier = 4 requests/10 saniye
+    Biz 25 saniye bekliyoruz = güvenli zona
+
+    Args:
+        loop: asyncio event loop - sync kod çalıştırmak için
+        conn: PostgreSQL connection (blocking I/O)
+        producer: Kafka producer (async)
+    """
     while True:
-        wait_seconds = POLL_INTERVAL_SECONDS
+        wait_seconds = POLL_INTERVAL_SECONDS  # Normal: 25 saniye
+
         try:
+            # 1️⃣ OpenSky API'den veri çek (blocking call - executor ile async yapıyoruz)
             flights = await loop.run_in_executor(None, fetch_states, REGION_BBOX)
+
+            # 2️⃣ PostgreSQL'e insert et (blocking - executor ile)
             await loop.run_in_executor(None, insert_flights, conn, flights)
+
+            # 3️⃣ Kafka'ya produce et (async - doğrudan await)
             await produce_to_kafka(producer, flights)
-            print(f"[{time.strftime('%H:%M:%S')}] {len(flights)} uçuş işlendi (Kafka'ya yazıldı).")
+
+            # Log - Kaç uçak işlendi
+            print(f"[{time.strftime('%H:%M:%S')}] ✅ {len(flights)} uçuş işlendi → Kafka'ya yazıldı")
+
         except requests.exceptions.HTTPError as exc:
+            # HTTP hataları - Rate limit, auth, server error
             status = exc.response.status_code if exc.response is not None else None
+
             if status == 429:
+                # Rate limit hatası - 2 dakika bekle
                 wait_seconds = RATE_LIMIT_BACKOFF_SECONDS
-                print(f"[{time.strftime('%H:%M:%S')}] OpenSky rate limit (429), {wait_seconds}s bekleniyor.", file=sys.stderr)
+                print(f"[{time.strftime('%H:%M:%S')}] ⚠️  OpenSky rate limit (429) - {wait_seconds}s bekleniyor", file=sys.stderr)
             else:
-                print(f"[{time.strftime('%H:%M:%S')}] Hata, atlanıyor: {exc}", file=sys.stderr)
+                # Diğer HTTP hataları - şu sefer atla, sonra tekrar dene
+                print(f"[{time.strftime('%H:%M:%S')}] ❌ API Hatası ({status}): {exc}", file=sys.stderr)
+
         except Exception as exc:
-            print(f"[{time.strftime('%H:%M:%S')}] Hata, atlanıyor: {exc}", file=sys.stderr)
+            # Network timeout, JSON parse error, vs
+            print(f"[{time.strftime('%H:%M:%S')}] ❌ Beklenmeyen hata: {exc}", file=sys.stderr)
+
+        # Bekleme - sonra döngü baştan başlasın
         await asyncio.sleep(wait_seconds)
 
 
 async def kafka_consumer_task(consumer: AIOKafkaConsumer) -> None:
-    """Kafka'dan oku ve WebSocket istemcilerine gönder"""
+    """
+    Kafka'dan flight mesajlarını oku ve tüm WebSocket istemcilerine yayınla.
+
+    Kafka Consumer group: "flight-radar-consumer"
+    Topic: "flights"
+
+    Akış:
+    1. Kafka'dan bir flight mesajı oku
+    2. JSON decode et
+    3. Tüm bağlı WebSocket istemcilerine gönder
+    4. Kapanan bağlantıları temizle
+
+    Advantages vs broadcast:
+    - Kafka topic'in offset'ini kullanarak missed messages'ı recover edebiliriz
+    - Multiple consumer instance'lar aynı topic'i okuyabilir (scaling)
+    - Persistent storage - Kafka log'unda saklanır
+
+    Args:
+        consumer: AIOKafkaConsumer instance
+    """
     try:
+        # Kafka topic'in mesajlarını stream olarak oku (consumer group offset'ten)
         async for message in consumer:
             try:
+                # Kafka mesajını JSON flight object'e dönüştür
                 flight = json.loads(message.value.decode("utf-8"))
+
+                # Eğer hiç client bağlı değilse veriyi yolla (sonra temizle)
                 if not connected_clients:
                     continue
 
-                stale = []
+                # Bağlı tüm WebSocket client'lara mesaj gönder
+                stale = []  # Kapanan bağlantılar
                 for client in list(connected_clients):
                     try:
+                        # Flight JSON'ını client'a gönder
                         await client.send(json.dumps(flight))
                     except ConnectionClosed:
+                        # Bu client kapandı - sonra kaldıracağız
                         stale.append(client)
 
+                # Kapanan bağlantıları set'ten çıkar
                 for client in stale:
                     connected_clients.discard(client)
+
             except Exception as exc:
-                print(f"Kafka mesajı işlenirken hata: {exc}", file=sys.stderr)
+                # Mesaj parsing hatası - loglama
+                print(f"❌ Kafka mesajı işlenirken hata: {exc}", file=sys.stderr)
+
     except Exception as exc:
-        print(f"Kafka Consumer bağlantı hatası: {exc}", file=sys.stderr)
+        # Consumer bağlantısı koptu - kritik hata
+        print(f"❌ Kafka Consumer bağlantı hatası: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -282,38 +516,88 @@ async def kafka_consumer_task(consumer: AIOKafkaConsumer) -> None:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    # PostgreSQL bağlantı
+    """
+    Ana başlangıç fonksiyonu - tüm bileşenleri orchestrate et.
+
+    Başlangıç sırası:
+    1. PostgreSQL'e bağlan
+    2. Tablo şemasını oluştur
+    3. Kafka Producer'a bağlan
+    4. Kafka Consumer'a bağlan
+    5. WebSocket sunucusu başlat
+    6. fetch_loop ve kafka_consumer_task'ı paralel çalıştır
+
+    Architecture:
+    ┌─────────────────────────────────────────────────────────┐
+    │         WebSocket Server (handle_client)               │
+    │         ↑                                                │
+    │         └─── Connected Clients (Frontend)              │
+    │                                                          │
+    │ kafka_consumer_task()                                   │
+    │ ├─ Kafka Consumer ← Topic "flights"                    │
+    │ └─ Send to WebSocket clients                           │
+    │                                                          │
+    │ fetch_loop()                                            │
+    │ ├─ OpenSky API → flights list                          │
+    │ ├─ PostgreSQL INSERT                                   │
+    │ └─ Kafka Producer → Topic "flights"                    │
+    └─────────────────────────────────────────────────────────┘
+    """
+
+    # 1️⃣ PostgreSQL'e bağlan (retry logic ile)
     conn = connect_with_retry()
     init_db(conn)
-    print("PostgreSQL hazır.")
 
-    # Kafka Producer
+    # 2️⃣ Kafka Producer'a bağlan (retry logic ile)
     producer = await connect_kafka_producer_with_retry(KAFKA_BROKER)
-    print(f"Kafka Producer başladı: {KAFKA_BROKER}")
 
-    # Kafka Consumer
+    # 3️⃣ Kafka Consumer'a bağlan (retry logic ile)
     consumer = await connect_kafka_consumer_with_retry(KAFKA_TOPIC, KAFKA_BROKER)
-    print(f"Kafka Consumer başladı: {KAFKA_TOPIC}")
 
+    # 4️⃣ Event loop referansı al (executor için)
     loop = asyncio.get_running_loop()
 
-    # WebSocket sunucusu ve tüm görevler beraber çalışsın
+    # 5️⃣ WebSocket sunucusu başlat
     async with serve(handle_client, WS_HOST, WS_PORT):
-        print(f"WebSocket sunucusu ws://{WS_HOST}:{WS_PORT} adresinde çalışıyor.")
+        print(f"\n🚀 Flight Radar Backend başladı!")
+        print(f"   📡 WebSocket: ws://{WS_HOST}:{WS_PORT}")
+        print(f"   🔌 Kafka: {KAFKA_BROKER}")
+        print(f"   💾 PostgreSQL: connected\n")
 
-        # Görevleri paralel olarak başlat
+        # 6️⃣ İki ana görev paralel olarak çalışsın
         tasks = [
+            # Görev 1: OpenSky API'den data çek → DB → Kafka
             fetch_loop(loop, conn, producer),
+
+            # Görev 2: Kafka'dan oku → WebSocket clients'a gönder
             kafka_consumer_task(consumer),
         ]
 
         try:
+            # asyncio.gather: Her iki task'ı paralel çalıştır
+            # Birisi fail olursa, error propagate olur
             await asyncio.gather(*tasks)
         finally:
+            # Shutdown - bağlantıları kapat
+            print("\n🛑 Kapatılıyor...")
             await producer.stop()
             await consumer.stop()
-            print("Kapatılıyor...")
+            print("✅ Tüm kaynaklar temizlendi")
 
 
 if __name__ == "__main__":
+    """
+    Entry point - Python interpreter bunu çalıştırırken girer.
+
+    asyncio.run(main()):
+    - Event loop oluştur
+    - main() coroutine'i çalıştır
+    - Sonuna kadar bekle (infinite gather loop)
+    - Hata veya KeyboardInterrupt'ta cleanup et
+
+    Başlatma:
+        python app.py
+        # veya Docker'da:
+        docker-compose up
+    """
     asyncio.run(main())
