@@ -165,29 +165,151 @@ async def connect_kafka_producer_with_retry(bootstrap_servers, delay_seconds=3.0
             await asyncio.sleep(delay_seconds)
 
 
-async def produce_to_kafka(producer, flights):
-    """Uçak verilerini Kafka topic'ine gönder."""
+async def produce_to_kafka(producer, flights, max_retries=3, retry_delay=2):
+    """
+    Uçak verilerini Kafka topic'ine gönder - retry logic ile.
+
+    Başarısız mesajlar dead_letter_queue'ya kaydedilir.
+    Dead Letter Queue: failed_flights.jsonl dosyası
+
+    Args:
+        producer: AIOKafkaProducer instance
+        flights: Flight list
+        max_retries: Maksimum retry sayısı
+        retry_delay: Retry aralığı (saniye)
+
+    Returns:
+        Başarısız flight'ların sayısı
+    """
+    failed_flights = []
+
     for flight in flights:
         message = json.dumps(flight).encode("utf-8")
-        await producer.send_and_wait(KAFKA_TOPIC, message)
+        success = False
+
+        # Retry loop - max 3 kez deneme
+        for attempt in range(1, max_retries + 1):
+            try:
+                await producer.send_and_wait(KAFKA_TOPIC, message, timeout_ms=10000)
+                success = True
+                break  # Başarılı, sonraki flight'a geç
+
+            except Exception as exc:
+                if attempt < max_retries:
+                    print(f"⚠️  Kafka yazma başarısız (deneme {attempt}/{max_retries}): {exc}", file=sys.stderr)
+                    await asyncio.sleep(retry_delay)
+                else:
+                    print(f"❌ Kafka yazma başarısız ({flight['icao24']}): {exc}", file=sys.stderr)
+                    failed_flights.append(flight)
+
+        if not success:
+            # Dead Letter Queue'ya kaydet
+            save_to_dlq(flight)
+
+    return len(failed_flights)
+
+
+def save_to_dlq(flight):
+    """Başarısız flight'ı Dead Letter Queue'ya kaydet."""
+    try:
+        with open("failed_flights.jsonl", "a") as f:
+            f.write(json.dumps({
+                "timestamp": time.time(),
+                "flight": flight,
+                "status": "failed_to_write_kafka"
+            }) + "\n")
+    except Exception as exc:
+        print(f"❌ DLQ yazma hatası: {exc}", file=sys.stderr)
+
+
+async def retry_failed_flights(producer, max_retries=3):
+    """Periodically başarısız flight'ları Kafka'ya yazmayı dene."""
+    dlq_file = "failed_flights.jsonl"
+
+    if not os.path.exists(dlq_file):
+        return 0
+
+    retry_count = 0
+    successful = []
+
+    try:
+        with open(dlq_file, "r") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    flight = entry["flight"]
+                    message = json.dumps(flight).encode("utf-8")
+
+                    # Retry Kafka yazma
+                    await producer.send_and_wait(KAFKA_TOPIC, message, timeout_ms=10000)
+                    successful.append(entry)
+                    retry_count += 1
+                    print(f"✅ Başarısız flight retry başarılı: {flight['icao24']}")
+
+                except Exception as exc:
+                    print(f"⚠️  Retry başarısız: {exc}", file=sys.stderr)
+
+        # Başarılı olanları DLQ'dan çıkar
+        if successful:
+            with open(dlq_file, "r") as f:
+                remaining = [line for line in f if json.loads(line) not in successful]
+
+            with open(dlq_file, "w") as f:
+                f.writelines(remaining)
+
+    except Exception as exc:
+        print(f"❌ DLQ retry hatası: {exc}", file=sys.stderr)
+
+    return retry_count
 
 
 async def fetch_loop(loop, conn, producer):
-    """Ana veri çekme döngüsü - API → DB → Kafka."""
+    """
+    Ana veri çekme döngüsü - API → DB → Kafka.
+
+    Veri Loss Prevention:
+    1. API'den çek (volatile)
+    2. PostgreSQL'e kaydet (persist - pg_data volume)
+    3. Kafka'ya yaz (retry + DLQ)
+
+    Kafka yazma başarısız olursa:
+    - failed_flights.jsonl'ye kaydedilir
+    - Sonraki cycle'da retry edilir
+    """
+    retry_interval = 0
+    retry_countdown = 0
+
     while True:
         wait_seconds = POLL_INTERVAL_SECONDS
 
         try:
-            # OpenSky API'den veri çek
+            # 🔄 Her 60 saniye başarısız flight'ları retry et
+            if retry_countdown <= 0:
+                retry_count = await retry_failed_flights(producer)
+                if retry_count > 0:
+                    print(f"[{time.strftime('%H:%M:%S')}] ✅ {retry_count} başarısız flight Kafka'ya yazıldı")
+                retry_countdown = 60  # 60 saniyede bir retry
+
+            retry_countdown -= wait_seconds
+
+            # 1️⃣ OpenSky API'den veri çek
             flights = await loop.run_in_executor(None, fetch_states, REGION_BBOX)
 
-            # PostgreSQL'e kaydet
-            await loop.run_in_executor(None, insert_flights, conn, flights)
+            # 2️⃣ PostgreSQL'e kaydet (PERSIST - data loss prevention)
+            inserted = await loop.run_in_executor(None, insert_flights, conn, flights)
 
-            # Kafka'ya gönder
-            await produce_to_kafka(producer, flights)
+            # 3️⃣ Kafka'ya gönder (retry + DLQ)
+            failed = await produce_to_kafka(producer, flights)
 
-            print(f"[{time.strftime('%H:%M:%S')}] ✅ {len(flights)} uçuş işlendi → Kafka'ya yazıldı")
+            status_msg = f"[{time.strftime('%H:%M:%S')}] ✅ {len(flights)} uçuş işlendi"
+            if inserted > 0:
+                status_msg += f" (DB: {inserted} satır)"
+            if failed > 0:
+                status_msg += f" (⚠️  {failed} başarısız → DLQ)"
+            else:
+                status_msg += " → Kafka'ya yazıldı"
+
+            print(status_msg)
 
         except requests.exceptions.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
