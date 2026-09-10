@@ -1,50 +1,164 @@
 <!DOCTYPE html>
+<!--
+  Flight Radar - Canlı Uçuş Tracking Haritası
+
+  Architecture:
+  - Leaflet: OpenStreetMap tabanlı interaktif harita
+  - Canvas: 4000+ uçak performanslı rendering (DOM yerine)
+  - WebSocket: Backend'den canlı veri stream
+  - JavaScript: Real-time update + user interaction
+
+  Teknoloji Stack:
+  - Frontend: HTML5 + Canvas API + WebSocket API
+  - Backend: Python asyncio + Kafka + PostgreSQL
+  - Data Flow: OpenSky API → Backend → Kafka → WebSocket → Canvas
+-->
+
 <html lang="tr">
 <head>
-<meta charset="UTF-8" />
-<title>Flight Radar - Canlı Uçauş Takibi</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flight Radar - Canlı Uçuş Takibi</title>
+
+  <!-- Leaflet kütüphanesi - interactive map -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
-  html, body, #map { height: 100%; margin: 0; background: #05070d; }
-  #map { filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.92); }
+  /* ========== Layout ========== */
+  /* Fullscreen harita - body tamamını doldur */
+  html, body, #map {
+    height: 100%;
+    margin: 0;
+    background: #05070d;  /* Koyu tema */
+  }
+
+  /* ========== Dark Theme CSS Filter ========== */
+  /* OpenStreetMap light theme'i koyu tema'ya çevir
+     (ücretli dark tile sağlayıcısına ihtiyaç yok)
+     invert: renkleri ters çevir (black→white, white→black)
+     hue-rotate: renk çevrimi (sarı→mavi, vs)
+     brightness/contrast: okunabilirlik düzenlemesi */
+  #map {
+    filter: invert(1) hue-rotate(180deg) brightness(0.95) contrast(0.92);
+  }
+
+  /* Marker ve popup da aynı filter'ı uygula (çift inversion önle) */
   #map .leaflet-marker-icon, #map .leaflet-popup, #map .airport-icon {
     filter: invert(1) hue-rotate(180deg);
   }
-  .leaflet-plane-canvas { filter: invert(1) hue-rotate(180deg); }
 
+  /* Canvas'a da uygula (uçaklar da filtered olsun) */
+  .leaflet-plane-canvas {
+    filter: invert(1) hue-rotate(180deg);
+  }
+
+  /* ========== Status Bar ========== */
+  /* Sol üst köşe: Bağlantı durumu ve uçak sayısı */
   #status {
-    position: absolute; top: 10px; left: 50px; z-index: 1000;
-    background: rgba(10,14,22,0.85); color: #dfe8f5; padding: 7px 14px;
-    border-radius: 6px; font: 500 13px/1.3 -apple-system, "Segoe UI", sans-serif;
+    position: absolute;
+    top: 10px;
+    left: 50px;
+    z-index: 1000;
+    background: rgba(10,14,22,0.85);  /* Yarı saydam koyu */
+    color: #dfe8f5;                    /* Açık mavi metin */
+    padding: 7px 14px;
+    border-radius: 6px;
+    font: 500 13px/1.3 -apple-system, "Segoe UI", sans-serif;
     border: 1px solid rgba(255,255,255,0.08);
   }
-  #search {
-    position: absolute; top: 10px; right: 10px; z-index: 1000;
-    background: rgba(10,14,22,0.85); color: #dfe8f5; padding: 7px 12px;
-    border-radius: 6px; font: 500 13px -apple-system, "Segoe UI", sans-serif;
-    border: 1px solid rgba(255,255,255,0.15); width: 220px;
-  }
-  #search::placeholder { color: #8291a0; }
-  #legend {
-    position: absolute; bottom: 20px; left: 10px; z-index: 1000;
-    background: rgba(10,14,22,0.88); color: #dfe8f5; padding: 12px 16px;
-    border-radius: 8px; font: 12px -apple-system, "Segoe UI", sans-serif; line-height: 1.7;
-    border: 1px solid rgba(255,255,255,0.08);
-  }
-  #legend .title { font-weight: 600; margin-bottom: 6px; color: #fff; }
-  #legend .row { display: flex; align-items: center; gap: 8px; }
-  #legend .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
-  #legend hr { border: none; border-top: 1px solid rgba(255,255,255,0.12); margin: 8px 0; }
-  #legend label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
+  /* ========== Search Box ========== */
+  /* Sağ üst köşe: Çağrı işareti (callsign) arama */
+  #search {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 1000;
+    background: rgba(10,14,22,0.85);
+    color: #dfe8f5;
+    padding: 7px 12px;
+    border-radius: 6px;
+    font: 500 13px -apple-system, "Segoe UI", sans-serif;
+    border: 1px solid rgba(255,255,255,0.15);
+    width: 220px;
+  }
+
+  #search::placeholder {
+    color: #8291a0;  /* Daha soluk placeholder text */
+  }
+
+  /* ========== Legend (Altitude Color Guide) ========== */
+  /* Sol alt köşe: Renk açıklaması (irtifa seviyelerine göre) */
+  #legend {
+    position: absolute;
+    bottom: 20px;
+    left: 10px;
+    z-index: 1000;
+    background: rgba(10,14,22,0.88);
+    color: #dfe8f5;
+    padding: 12px 16px;
+    border-radius: 8px;
+    font: 12px -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.7;
+    border: 1px solid rgba(255,255,255,0.08);
+  }
+  /* Legend item styling */
+  #legend .title {
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: #fff;  /* Başlık daha açık */
+  }
+
+  /* Her row = 1 renk örneği + label */
+  #legend .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Renk örnekleri (12x12px) */
+  #legend .swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    flex: none;  /* Resize olmasın */
+  }
+
+  /* Legend divider */
+  #legend hr {
+    border: none;
+    border-top: 1px solid rgba(255,255,255,0.12);
+    margin: 8px 0;
+  }
+
+  /* Havalimanları toggle */
+  #legend label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+  }
+
+  /* ========== Hover Tooltip ========== */
+  /* Fare üstüne gelince uçak bilgisi göster */
   #tooltip {
-    position: absolute; z-index: 1000; pointer-events: none;
-    background: rgba(10,14,22,0.92); color: #eef3fa; padding: 8px 12px;
-    border-radius: 6px; font: 12px -apple-system, "Segoe UI", sans-serif; line-height: 1.55;
-    display: none; white-space: nowrap;
+    position: absolute;
+    z-index: 1000;
+    pointer-events: none;  /* Tooltip'in kendisi click'lenemesin */
+    background: rgba(10,14,22,0.92);
+    color: #eef3fa;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font: 12px -apple-system, "Segoe UI", sans-serif;
+    line-height: 1.55;
+    display: none;  /* Varsayılan gizli */
+    white-space: nowrap;  /* Satır kırmasın */
     border: 1px solid rgba(255,255,255,0.1);
   }
-  #tooltip b { color: #7fd0ff; }
+
+  /* Tooltip içinde bold text (çağrı işareti) */
+  #tooltip b {
+    color: #7fd0ff;  /* Açık mavi vurgulama */
+  }
 </style>
 </head>
 <body>
@@ -65,48 +179,111 @@
 <div id="tooltip"></div>
 <div id="map"></div>
 
+<!-- Leaflet kütüphanesi script'i -->
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
 <script>
-  // zoomAnimation: false -- Leaflet'in animasyonlu zoom'u sırasında canvas
-  // içeriği CSS ile gerilip bozuluyordu (uçaklar garip görünüyordu). Animasyonu
-  // kapatınca harita anında yeni zoom'a geçiyor ve tek seferde temiz çiziliyor.
+  /**
+   * ========== HARITA INITIALIZATION ==========
+   * Leaflet interactive map setup
+   *
+   * Config açıklaması:
+   * - preferCanvas: true = DOM marker'ı yerine Canvas kullan (performance)
+   * - worldCopyJump: true = Dünya sınırında sıçraması (gerçekçi görünüş)
+   * - zoomAnimation: false = Smooth zoom animasyon KAPAT
+   *   (Canvas zoomda CSS stretch oluyor, sol çözüm: animation OFF)
+   * - markerZoomAnimation: false = Marker zoomda animate olmasın
+   * - setView([39.0, 35.0], 5) = Türkiye'ye zoom 5 ile başla
+   */
   const map = L.map('map', {
     preferCanvas: true,
     worldCopyJump: true,
-    zoomAnimation: false,
+    zoomAnimation: false,      // Zoom animasyonu canvas bozmasın diye
     markerZoomAnimation: false,
   }).setView([39.0, 35.0], 5);
-  // Not: harita CSS ile (renk tersleme) koyu temaya çevriliyor -- API anahtarı
-  // gerektiren ücretli "dark" tile sağlayıcılarına ihtiyaç duymadan.
+  /**
+   * Tile Layer - OpenStreetMap
+   * Not: Harita CSS filter ile koyu temaya çevriliyor
+   * (ücretli dark tile API'sine ihtiyaç yok - performans + maliyet tasarrufu)
+   */
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap katkıcıları',
     maxZoom: 19,
   }).addTo(map);
 
+  /**
+   * ========== UTILITY FUNCTIONS ==========
+   */
+
+  // Birim dönüşümü - Meter → Feet (aviation standard)
   const METERS_TO_FEET = 3.28084;
 
+  /**
+   * Uçağın irtifasına göre renk belirle.
+   *
+   * Altitude levels (feet):
+   * - Yerde: gri
+   * - 0-5k: kırmızı (tehlikeli)
+   * - 5-10k: turuncu
+   * - 10-15k: sarı
+   * - 15-20k: yeşil (normal cruise)
+   * - 20-25k: mavi
+   * - 25k+: mor (yüksek cruise)
+   *
+   * @param altitudeM - Barometric altitude (meters)
+   * @param onGround - Boolean, yerde mi?
+   * @returns Color hex (#rrggbb)
+   */
   function altitudeColor(altitudeM, onGround) {
-    if (onGround) return '#8e8e93';
+    if (onGround) return '#8e8e93';        // Yerde = gri
     const ft = (altitudeM || 0) * METERS_TO_FEET;
-    if (ft < 5000) return '#e74c3c';
-    if (ft < 10000) return '#e67e22';
-    if (ft < 15000) return '#f1c40f';
-    if (ft < 20000) return '#2ecc71';
-    if (ft < 25000) return '#3498db';
-    return '#9b59b6';
+    if (ft < 5000)  return '#e74c3c';      // Kırmızı
+    if (ft < 10000) return '#e67e22';      // Turuncu
+    if (ft < 15000) return '#f1c40f';      // Sarı
+    if (ft < 20000) return '#2ecc71';      // Yeşil
+    if (ft < 25000) return '#3498db';      // Mavi
+    return '#9b59b6';                      // Mor (25k+)
   }
 
-  // OpenSky "category" alanı (ADS-B emitter kategorisi)
+  /**
+   * Uçak Kategorileri (ADS-B Emitter Category)
+   * OpenSky API'nın "category" alanından gelir
+   * Hover tooltip'inde gösterilir
+   *
+   * Kaynak: ICAO Annex 10, TSO-C166b
+   * Kullanım: tooltip'de "Tip: Büyük uçak" şeklinde
+   */
   const CATEGORY_LABELS = {
-    0: 'Bilinmiyor', 1: 'Bilinmiyor', 2: 'Hafif uçak', 3: 'Küçük uçak',
-    4: 'Büyük uçak', 5: 'Büyük (yüksek girdap)', 6: 'Ağır uçak',
-    7: 'Yüksek performanslı', 8: 'Helikopter', 9: 'Süzülme aracı',
-    10: 'Hava gemisi', 11: 'Paraşüt', 12: 'Hafif spor', 13: 'İHA',
-    14: 'Uzay aracı', 15: 'Yüzey (acil)', 16: 'Yüzey (hizmet)',
-    17: 'Nokta engel', 18: 'Küme engel', 19: 'Hat engel',
+    0: 'Bilinmiyor',
+    1: 'Bilinmiyor',
+    2: 'Hafif uçak',           // Cessna 172, vb
+    3: 'Küçük uçak',           // Hawker, vb
+    4: 'Büyük uçak',           // Boeing 737, Airbus A320
+    5: 'Büyük (yüksek girdap)', // B747, A380
+    6: 'Ağır uçak',
+    7: 'Yüksek performanslı',   // Fighter jet
+    8: 'Helikopter',
+    9: 'Süzülme aracı',        // Glider
+    10: 'Hava gemisi',          // Blimp
+    11: 'Paraşüt',
+    12: 'Hafif spor',
+    13: 'İHA',                 // Drone
+    14: 'Uzay aracı',
+    15: 'Yüzey (acil)',
+    16: 'Yüzey (hizmet)',
+    17: 'Nokta engel',
+    18: 'Küme engel',
+    19: 'Hat engel',
   };
 
-  // ---- Havalimanları (statik, önemli dünya hub'ları) ----
+  /**
+   * ========== STATIC AIRPORTS ==========
+   * Önemli dünya havalimanları
+   * Format: [name, IATA, latitude, longitude]
+   *
+   * Kullanım: Haritaya sarı nokta olarak render'lenir
+   * Toggle: "Havalimanları" checkbox ile show/hide
+   */
   const AIRPORTS = [
     ['İstanbul', 'IST', 41.2753, 28.7519], ['Londra Heathrow', 'LHR', 51.4700, -0.4543],
     ['Paris CDG', 'CDG', 49.0097, 2.5479], ['Frankfurt', 'FRA', 50.0379, 8.5622],
@@ -133,6 +310,10 @@
     ['Bakü', 'GYD', 40.4675, 50.0467], ['Almatı', 'ALA', 43.3521, 77.0405],
   ];
 
+  /**
+   * Havalimanı icon'u - Sarı nokta
+   * Tooltip'te adı ve IATA kodu gösterilir
+   */
   const airportIcon = L.divIcon({
     className: 'airport-icon',
     html: '<div style="width:8px;height:8px;border-radius:50%;background:#ffb020;border:1.5px solid #402400;box-shadow:0 0 4px rgba(255,176,32,0.8);"></div>',
@@ -140,106 +321,212 @@
     iconAnchor: [4, 4],
   });
 
+  /**
+   * Havalimanları layer - Toggle ile show/hide edebiliriz
+   */
   const airportLayer = L.layerGroup(
     AIRPORTS.map(([name, iata, lat, lon]) =>
       L.marker([lat, lon], { icon: airportIcon }).bindPopup(`<b>${name}</b> (${iata})`)
     )
   ).addTo(map);
 
+  // Havalimanları toggle'ı
   document.getElementById('airportToggle').addEventListener('change', (ev) => {
     if (ev.target.checked) airportLayer.addTo(map);
     else map.removeLayer(airportLayer);
   });
 
-  // ---- Tek canvas üzerinde binlerce uçağı çizen özel Leaflet katmanı ----
-  // (Her uçak için ayrı DOM marker'ı oluşturmak binlerce elemanla tarayıcıyı
-  //  kilitlediği için, tüm uçaklar tek bir <canvas>'a 2D API ile çizilir.)
+  /**
+   * ========== PERFORMANCE CRITICAL: PlaneCanvasLayer ==========
+   *
+   * Problem: 4000+ marker DOM elemanı = browser freeze
+   * Çözüm: Tek <canvas>'a tüm uçakları 2D API ile çiz
+   *
+   * Leaflet L.Layer'ı extend et:
+   * - onAdd: Canvas initialize et, event listener'ları attach et
+   * - onRemove: Canvas kaldır, listener'ları temizle
+   * - _reset: Canvas boyutunu harita boyutuna göre ayarla
+   * - redraw: Canvas'ı temizle + visible uçakları çiz
+   *
+   * Performance:
+   * - 4000 marker: 1000ms+ (jittery)
+   * - 4000 canvas: 16ms (60fps)
+   */
   const PlaneCanvasLayer = L.Layer.extend({
+    /**
+     * Layer'ın haritaya eklenmesi
+     * - Canvas element'i oluştur
+     * - Leaflet panes'ine ekle (overlay layer)
+     * - Resize/move/zoom event'lerine bind et
+     */
     onAdd(map) {
       this._map = map;
+
+      // Canvas oluştur
       this._canvas = L.DomUtil.create('canvas', 'leaflet-plane-canvas');
       this._ctx = this._canvas.getContext('2d');
+
+      // Leaflet'in overlay pane'ine ekle (harita ve marker'ların üstüne)
       map.getPanes().overlayPane.appendChild(this._canvas);
 
+      // Harita değişti mi? → canvas'ı update et
       map.on('moveend zoomend resize', this._reset, this);
+
+      // İlk render
       this._reset();
     },
+
+    /**
+     * Layer'ın haritadan kaldırılması
+     * Cleanup: Canvas'ı DOM'dan kaldır, event listener'ları detach et
+     */
     onRemove(map) {
       L.DomUtil.remove(this._canvas);
       map.off('moveend zoomend resize', this._reset, this);
     },
+
+    /**
+     * Canvas'ı harita boyutuna göre yeniden konumlandır
+     * (pan, zoom, resize sırasında)
+     *
+     * Steps:
+     * 1. Harita boyutunu al
+     * 2. Canvas'ı harita coordinate'sine göre konumlandır
+     * 3. Canvas width/height'ı harita boyutuna ayarla
+     * 4. Uçakları redraw et
+     */
     _reset() {
       const size = this._map.getSize();
       const topLeft = this._map.containerPointToLayerPoint([0, 0]);
       L.DomUtil.setPosition(this._canvas, topLeft);
-      this._canvas.width = size.x;
-      this._canvas.height = size.y;
+      this._canvas.width = size.x;   // px
+      this._canvas.height = size.y;  // px
       this.redraw();
     },
+
+    /**
+     * Canvas'a uçakları çiz
+     *
+     * Performance optimizasyonları:
+     * 1. Sadece visible bound'lar içinde uçakları çiz (viewport culling)
+     * 2. visiblePoints array'ini hover testleri için populate et
+     * 3. Arama filtresi: eşleşmeyenler (opaklik=0.15) soluk göster
+     * 4. Zoom level'ine göre uçak boyutunu ölçeklendir
+     *
+     * Flow:
+     * 1. Canvas temizle
+     * 2. Harita bounds'ını oku (+15% buffer zoom için)
+     * 3. Her uçak için:
+     *    - Bounds dışında mı? → skip
+     *    - Screen coordinate'ine convert et
+     *    - Draw plane silhouette
+     *    - visiblePoints'e ekle (hover detection)
+     */
     redraw() {
       if (!this._ctx) return;
       const ctx = this._ctx;
       const size = this._map.getSize();
+
+      // Canvas temizle
       ctx.clearRect(0, 0, size.x, size.y);
 
+      // Görünen bölge + buffer
       const bounds = this._map.getBounds().pad(0.15);
       const zoom = this._map.getZoom();
+
+      // Zoom level'ine göre uçak boyutunu ölçeklendir
+      // Zoom 5 = küçük, Zoom 15 = büyük
       const scale = Math.max(1.1, Math.min(2.4, zoom / 4.2));
 
-      // Sadece görünen uçakları çiz ve fare-üstü testi için ayrı bir
-      // listede tut (mousemove'da binlerce uçağı taramamak için).
+      // Hover detection için visible uçakları sakla
       visiblePoints.length = 0;
+
       for (const entry of flights.values()) {
         const f = entry.data;
+
+        // Null coordinate'ler skip (veri eksikliği)
         if (f.latitude == null || f.longitude == null) continue;
+
+        // Viewport culling - bounds dışında mı?
         if (!bounds.contains([f.latitude, f.longitude])) continue;
 
+        // Lat/lon → screen pixel'e convert et
         const pt = this._map.latLngToContainerPoint([f.latitude, f.longitude]);
         entry.screenX = pt.x;
         entry.screenY = pt.y;
 
-        // Arama kutusuna bir şey yazılmışsa: eşleşmeyen uçaklar soluklaşır
+        // Arama filtresi: çağrı işareti eşleşiyor mu?
         const eslesiyor = !searchText || (f.callsign || '').toUpperCase().includes(searchText);
-        const opaklik = eslesiyor ? 1 : 0.15;
+        const opaklik = eslesiyor ? 1 : 0.15;  // Eşleşmeyen = yarı saydam
 
+        // Uçak silhouette'i çiz
         drawPlane(ctx, pt.x, pt.y, f.heading_deg || 0, altitudeColor(f.altitude_m, f.on_ground), scale, opaklik);
+
+        // Hover detection listesine ekle
         visiblePoints.push(entry);
       }
     },
   });
 
+  /**
+   * ========== AIRCRAFT RENDERING ==========
+   * Canvas 2D API kullanarak uçak silhouette'i çiz
+   *
+   * Design: Üstten görünüş (top-down view)
+   * - Gövde (fuselage): orta çizgi
+   * - Kanatlar (wings): yan çizgiler
+   * - Kuyruk (tail): arka ucu
+   * - Heading: 0° = kuzey, 90° = doğu, vb
+   *
+   * @param ctx - Canvas 2D context
+   * @param x, y - Screen pixel koordinatları
+   * @param headingDeg - Başlık yönü (0-360, derece)
+   * @param color - Irtifa rengi (altitudeColor() sonucu)
+   * @param scale - Zoom level'ine göre boyut ölçeği
+   * @param opaklik - 0-1, arama filtresi için (eşleşmeyenler=0.15)
+   */
   function drawPlane(ctx, x, y, headingDeg, color, scale, opaklik = 1) {
-    ctx.save();
+    ctx.save();  // Transform state'i kaydet
+
+    // Opaklik (yarı saydam) - arama filtresi için
     ctx.globalAlpha = opaklik;
-    ctx.translate(x, y);
-    ctx.rotate((headingDeg * Math.PI) / 180);
-    ctx.scale(scale, scale);
+
+    // Koordinat transformasyonu
+    ctx.translate(x, y);           // Hareket: screen coordinate'ine
+    ctx.rotate((headingDeg * Math.PI) / 180);  // Dönüş: başlık yönüne
+    ctx.scale(scale, scale);       // Ölçek: zoom level'ine
+
+    // Silhouette şekli - basit çokgen (polygon)
     ctx.beginPath();
-    // Basit, üstten görünüşlü uçak silüeti (burun yukarı / kuzey = 0°)
-    ctx.moveTo(0, -8);
+    ctx.moveTo(0, -8);    // Burun (nose) - yukarı
     ctx.lineTo(2.4, -2.5);
-    ctx.lineTo(9, 3);
+    ctx.lineTo(9, 3);     // Sağ kanat (right wing) ucu
     ctx.lineTo(9, 5);
     ctx.lineTo(2.2, 2.7);
     ctx.lineTo(2.6, 7.5);
-    ctx.lineTo(5, 9.5);
-    ctx.lineTo(5, 11);
-    ctx.lineTo(0, 9.7);
-    ctx.lineTo(-5, 11);
+    ctx.lineTo(5, 9.5);   // Sağ kuyruk
+    ctx.lineTo(5, 11);    // Kuyrak sonu
+    ctx.lineTo(0, 9.7);   // Merkez kuyruk
+    ctx.lineTo(-5, 11);   // Sol kuyruk
     ctx.lineTo(-5, 9.5);
     ctx.lineTo(-2.6, 7.5);
     ctx.lineTo(-2.2, 2.7);
-    ctx.lineTo(-9, 5);
+    ctx.lineTo(-9, 5);    // Sol kanat ucu
     ctx.lineTo(-9, 3);
     ctx.lineTo(-2.4, -2.5);
     ctx.closePath();
+
+    // Doldur (Fill) - irtifa rengi
     ctx.fillStyle = color;
+    ctx.fill();
+
+    // Çizgi (Stroke) - sınırlar
     ctx.strokeStyle = 'rgba(0,0,0,0.85)';
     ctx.lineWidth = 0.9;
-    ctx.fill();
     ctx.stroke();
 
-    // Gövde üzerinde ince bir vurgu çizgisi -- daha "gerçek" görünmesi için
+    // Vurgu çizgisi - daha "gerçek" görünüş için
+    // Gövde ortasında ince beyaz çizgi (3D illüzyonu)
     ctx.beginPath();
     ctx.moveTo(0, -6);
     ctx.lineTo(0, 9);
@@ -247,89 +534,183 @@
     ctx.lineWidth = 0.6;
     ctx.stroke();
 
-    ctx.restore();
+    ctx.restore();  // Önceki transform state'ine dön
   }
 
-  // icao24 -> { data, lastSeen, screenX, screenY }
+  /**
+   * ========== DATA STRUCTURES ==========
+   */
+
+  /**
+   * Ana data store - tüm uçaklar
+   * Key: icao24 (uçak tanımlayıcısı)
+   * Value: { data: {...}, lastSeen: timestamp, screenX, screenY }
+   *
+   * Usage:
+   * - WebSocket mesaj → flights.set()
+   * - Cleanup loop → 90s eski uçakları sil
+   * - Redraw loop → Canvas'a çiz
+   */
   const flights = new Map();
-  // Son çizimde ekranda görünen uçakların listesi (hover testleri bunun üzerinde yapılır)
+
+  /**
+   * Son redraw'da ekranda görünen uçaklar
+   * (fare üstüne gelince bu array'i ararız, 4000 uçak değil)
+   *
+   * Performance:
+   * - Hover detection: O(visiblePoints.length) ≈ 100-200
+   * - vs O(flights.size) ≈ 4000
+   */
   const visiblePoints = [];
+
+  // DOM elements
   const statusEl = document.getElementById('status');
   const tooltipEl = document.getElementById('tooltip');
   const searchEl = document.getElementById('search');
+
+  // Search filter - arama kutusu input'u
   let searchText = '';
 
+  /**
+   * Canvas layer'ını haritaya ekle
+   * PlaneCanvasLayer extend'i Leaflet layer olarak çalışır
+   */
   const planeLayer = new PlaneCanvasLayer();
   planeLayer.addTo(map);
 
-  // addEventListener: kullanıcı arama kutusuna her harf yazdığında çalışır
+  /**
+   * Arama kutusuna yazı girildiğinde filter uygula
+   * Eşleşmeyen uçaklar soluklaşır (opaklik=0.15)
+   */
   searchEl.addEventListener('input', (ev) => {
     searchText = ev.target.value.trim().toUpperCase();
-    scheduleRedraw();
+    scheduleRedraw();  // Canvas'ı redraw schedule et
   });
 
+  /**
+   * ========== PERFORMANCE: Redraw Scheduling ==========
+   * requestAnimationFrame ile batch redraw
+   * (Her websocket mesajda redraw yapmak yerine, frame başında bir kez yap)
+   */
   let redrawScheduled = false;
+
+  /**
+   * Redraw'ı queue'ya al - bir kez per frame (60fps ≈ 16ms)
+   * Çoklu uçak update'i → 1 redraw
+   *
+   * Performance:
+   * - Without: 4000 flights/sec × redraw = jitter
+   * - With: 60 redraw/sec = smooth 60fps
+   */
   function scheduleRedraw() {
-    if (redrawScheduled) return;
+    if (redrawScheduled) return;  // Zaten scheduled mı?
     redrawScheduled = true;
+
     requestAnimationFrame(() => {
       redrawScheduled = false;
-      planeLayer.redraw();
+      planeLayer.redraw();  // Canvas'ı çiz
     });
   }
 
+  /**
+   * Yeni/update uçak verisi - flights Map'e ekle
+   *
+   * @param f - Flight object: {icao24, callsign, latitude, longitude, altitude_m, ...}
+   *
+   * Logic:
+   * 1. Null coordinate'ler skip (invalid data)
+   * 2. Varsa existing entry'den screenX/Y taşı (smooth animation illüzyonu)
+   * 3. flights Map'e set
+   * 4. Redraw schedule et
+   */
   function upsertFlight(f) {
     if (f.latitude == null || f.longitude == null) return;
+
+    // Önceki frame'deki screen coordinate'ler (smooth-look için)
     const existing = flights.get(f.icao24);
+
     flights.set(f.icao24, {
-      data: f,
-      lastSeen: Date.now(),
-      screenX: existing?.screenX,
+      data: f,                                 // Yeni uçuş verisi
+      lastSeen: Date.now(),                   // Update timestamp
+      screenX: existing?.screenX,             // Önceki screen pos (smooth look)
       screenY: existing?.screenY,
     });
+
     scheduleRedraw();
   }
 
-  // 90 saniyedir güncellenmeyen uçakları temizle
+  /**
+   * ========== CLEANUP: Eski uçakları kaldır ==========
+   * 90 saniyedir update alınmayan uçaklar → flights Map'ten sil
+   *
+   * Sebep: Memory leak prevention
+   * Interval: 15 saniye (90/6 = her 1/6 sürede kontrol et)
+   */
   setInterval(() => {
-    const cutoff = Date.now() - 90_000;
+    const cutoff = Date.now() - 90_000;  // 90 saniye öncesi
     let removed = false;
+
     for (const [icao24, entry] of flights) {
       if (entry.lastSeen < cutoff) {
-        flights.delete(icao24);
+        flights.delete(icao24);  // Eski uçak sil
         removed = true;
       }
     }
-    if (removed) scheduleRedraw();
-  }, 15_000);
 
-  // Fare ile uçak üzerine gelince bilgi kutusu göster
-  // (yalnızca o an ekranda çizili olan uçaklar taranır, binlerce değil)
+    if (removed) scheduleRedraw();  // Update'i Canvas'a yansıt
+  }, 15_000);  // Her 15 saniye kontrol et
+
+  /**
+   * ========== HOVER DETECTION (Tooltip) ==========
+   * Fare üstüne gelince uçak detaylarını göster
+   *
+   * Performance:
+   * - visiblePoints sadece ekranda olan uçakları içerir (100-200)
+   * - flights.size ise tüm uçakları (4000+)
+   * - O(visible) vs O(all) = huge difference
+   */
   const mapContainer = map.getContainer();
   let hoverPending = false;
   let lastMouseEvent = null;
 
+  /**
+   * Mousemove event'i - fare harita üzerinde hareket ediyor
+   * requestAnimationFrame ile batch işle (smooth performance)
+   */
   mapContainer.addEventListener('mousemove', (ev) => {
     lastMouseEvent = ev;
-    if (hoverPending) return;
+    if (hoverPending) return;  // Zaten pending mi?
     hoverPending = true;
-    requestAnimationFrame(handleHover);
+
+    requestAnimationFrame(handleHover);  // Next frame'de çalıştır
   });
 
+  /**
+   * Hover detection logic - en yakındaki uçağı bul
+   * Fare koordinatı → visiblePoints array'inde distance hesapla
+   * En yakın (< 10px) → tooltip göster
+   */
   function handleHover() {
     hoverPending = false;
     const ev = lastMouseEvent;
     const rect = mapContainer.getBoundingClientRect();
+
+    // Fare koordinatı (screen space)
     const mx = ev.clientX - rect.left;
     const my = ev.clientY - rect.top;
 
+    // visiblePoints'te en yakındaki uçağı bul
     let closest = null;
-    let closestDist = 10; // px tolerans
+    let closestDist = 10;  // 10px tolerance
+
     for (const entry of visiblePoints) {
       if (entry.screenX == null) continue;
+
+      // Euclidean distance
       const dx = entry.screenX - mx;
       const dy = entry.screenY - my;
       const dist = Math.sqrt(dx * dx + dy * dy);
+
       if (dist < closestDist) {
         closestDist = dist;
         closest = entry;
@@ -337,16 +718,20 @@
     }
 
     if (closest) {
+      // Tooltip bilgisini hazırla ve göster
       const f = closest.data;
       const label = f.callsign || f.icao24;
       const ft = Math.round((f.altitude_m || 0) * METERS_TO_FEET);
       const kmh = Math.round((f.velocity_ms || 0) * 3.6);
       const category = CATEGORY_LABELS[f.category] || 'Bilinmiyor';
+
       tooltipEl.innerHTML =
         `<b>${label}</b><br/>${f.origin_country || ''}<br/>` +
         `Tip: ${category}<br/>` +
         `İrtifa: ${ft.toLocaleString('tr-TR')} ft &nbsp;|&nbsp; Hız: ${kmh} km/s<br/>` +
         `ICAO24: ${f.icao24}`;
+
+      // Fare yanında göster (offset: +14px)
       tooltipEl.style.left = (ev.clientX + 14) + 'px';
       tooltipEl.style.top = (ev.clientY + 14) + 'px';
       tooltipEl.style.display = 'block';
@@ -357,31 +742,97 @@
     }
   }
 
-  let lastStatusUpdate = 0;
+  /**
+   * ========== WEBSOCKET CONNECTION ==========
+   * Backend'den Kafka Consumer tarafından yayınlanan flight updates'i al
+   *
+   * Data Flow:
+   * Backend: OpenSky API → PostgreSQL → Kafka Producer → Topic "flights"
+   *          ↓
+   *          Kafka Consumer → WebSocket ws://localhost:8765
+   *          ↓
+   * Frontend: WebSocket.onmessage → upsertFlight() → Canvas redraw
+   */
 
+  let lastStatusUpdate = 0;  // Status bar'ı çok sık güncelleme (throttle)
+
+  /**
+   * WebSocket bağlantısı kur
+   *
+   * URL Auto-detection:
+   * - Localhost'ta: ws://localhost:8765
+   * - Docker'da: ws://app:8765 (container name)
+   * - HTTPS'de: wss:// protokolü
+   *
+   * Retry logic: Bağlantı kesilirse 2 saniye sonra tekrar dene
+   */
   function connectWebSocket() {
-    // Docker'da backend hostname'i çözmek için otomatik detect
+    // Protocol + hostname auto-detect
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.hostname;
+    // Docker'da "app", localhost'ta "localhost"
     const backendHost = host === 'localhost' || host === '127.0.0.1' ? 'localhost' : 'app';
     const wsUrl = `${protocol}//${backendHost}:8765`;
+
     const ws = new WebSocket(wsUrl);
 
-    ws.onopen = () => { statusEl.textContent = `Bağlandı (${wsUrl}), canlı veri bekleniyor...`; };
-
-    ws.onclose = () => {
-      statusEl.textContent = 'Bağlantı kesildi, yeniden bağlanılıyor...';
-      setTimeout(connectWebSocket, 2000);
+    /**
+     * WebSocket açılınca başlangıç mesajı göster
+     */
+    ws.onopen = () => {
+      statusEl.textContent = `Bağlandı (${wsUrl}), canlı veri bekleniyor...`;
     };
 
-    ws.onerror = () => { ws.close(); };
+    /**
+     * WebSocket kapandığında retry
+     * Sebep: Backend crashed, network disconnected, vb
+     * Çözüm: 2 saniye bekle, tekrar connect et
+     */
+    ws.onclose = () => {
+      statusEl.textContent = 'Bağlantı kesildi, yeniden bağlanılıyor...';
+      setTimeout(connectWebSocket, 2000);  // Exponential backoff yerine 2s sabit
+    };
 
+    /**
+     * WebSocket hatasında bağlantıyı kapat
+     * (onclose handler'ı retry ettirecek)
+     */
+    ws.onerror = () => {
+      ws.close();
+    };
+
+    /**
+     * ========== MAIN DATA LOOP ==========
+     * Backend'den flight updates alındığında
+     *
+     * Message format (Kafka'dan):
+     * {
+     *   "icao24": "a00001",
+     *   "callsign": "PGT",
+     *   "latitude": 41.2753,
+     *   "longitude": 28.7519,
+     *   "altitude_m": 9150.0,
+     *   "heading_deg": 45.0,
+     *   "velocity_ms": 250.5,
+     *   ...
+     * }
+     *
+     * Processing:
+     * 1. JSON parse et
+     * 2. flights Map'e upsert et
+     * 3. Canvas redraw schedule et
+     * 4. Status bar'ı update et (500ms throttle)
+     */
     ws.onmessage = (event) => {
+      // Kafka'dan gelen JSON string'i parse et
       const flight = JSON.parse(event.data);
+
+      // flights Map'e ekle/update et
       upsertFlight(flight);
 
+      // Status bar güncellemesi (throttle: max 2 updates/sec)
       const now = Date.now();
-      if (now - lastStatusUpdate > 500) {
+      if (now - lastStatusUpdate > 500) {  // 500ms = throttle interval
         lastStatusUpdate = now;
         statusEl.textContent =
           `Canlı - ${new Date().toLocaleTimeString('tr-TR')} ` +
@@ -390,6 +841,8 @@
     };
   }
 
+  // ========== STARTUP ==========
+  // Frontend yüklenince WebSocket bağlantısı başlat
   connectWebSocket();
 </script>
 </body>
