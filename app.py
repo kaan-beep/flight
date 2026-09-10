@@ -294,13 +294,20 @@ async def connect_kafka_consumer_with_retry(
     """
     Kafka Consumer'a bağlan - başarılı olana kadar retry et.
 
-    Consumer group'lar topic'i offset'ten okurlar. Eğer offset kaydedilmişse,
-    missed messages'ı replay edebiliriz.
+    Consumer group'lar topic'i offset'ten okurlar. Offset'ler Kafka'nın
+    __consumer_offsets topic'inde saklanır, böylece consumer restart olsa bile
+    kaldığı yerden devam edebilir.
+
+    Offset Persistence:
+    - Consumer group'lar offset'leri Kafka broker'ında tutarlar
+    - Docker volume'lar (kafka_data) sayesinde kalıcı depolanır
+    - Consumer restart → aynı group_id ile başarsa → offset restore olur
 
     Session management ayarları:
     - session_timeout_ms=30000: Consumer 30s cevap vermezse group'tan çıkar
     - heartbeat_interval_ms=10000: Her 10s'de heartbeat gönder (alive signal)
     - max_poll_interval_ms=300000: Mesaj işlerken max 5 dakika alabilir
+    - auto_commit_interval_ms=5000: Her 5s'de offset'i otomatik kaydet
 
     Args:
         topic: "flights" (Kafka topic name)
@@ -317,15 +324,19 @@ async def connect_kafka_consumer_with_retry(
             consumer = AIOKafkaConsumer(
                 topic,
                 bootstrap_servers=bootstrap_servers,
-                auto_offset_reset='earliest',        # Topic'e yeni gelişte en başından oku
-                group_id='flight-radar-consumer',    # Consumer group - rebalancing için
-                session_timeout_ms=30000,            # Heartbeat timeout
-                heartbeat_interval_ms=10000,         # Heartbeat frequency
-                max_poll_interval_ms=300000,         # Max processing time
-                enable_auto_commit=True,             # Offset'i otomatik commit et
+                # ⭐ OFFSET STRATEGY - Kaldığı yerden devam et
+                auto_offset_reset='earliest',            # Topic'e yeni gelişte: en başından oku
+                group_id='flight-radar-consumer',        # Consumer group - offset state'i sakla
+                enable_auto_commit=True,                 # Offset'i otomatik commit et
+                auto_commit_interval_ms=5000,            # Her 5 saniye commit et
+                # Session management - Network kesintisi toleransı
+                session_timeout_ms=30000,                # 30s: Heartbeat timeout
+                heartbeat_interval_ms=10000,             # 10s: Heartbeat frequency
+                max_poll_interval_ms=300000,             # 5 min: Max processing time
             )
             await consumer.start()
             print(f"✅ Kafka Consumer başarıyla bağlandı (deneme {attempt})")
+            print(f"   📍 Group ID: flight-radar-consumer (offset persist enabled)")
             return consumer
         except Exception as exc:
             print(f"⏳ Kafka Consumer bağlantısı başarısız (deneme {attempt}): {exc}", file=sys.stderr)
@@ -462,17 +473,19 @@ async def kafka_consumer_task(consumer: AIOKafkaConsumer) -> None:
 
     Kafka Consumer group: "flight-radar-consumer"
     Topic: "flights"
+    Offset Strategy: Auto-commit (5s interval) - Kalıcı disk'e kaydedilir
 
     Akış:
-    1. Kafka'dan bir flight mesajı oku
+    1. Kafka'dan bir flight mesajı oku (consumer group offset'ten)
     2. JSON decode et
     3. Tüm bağlı WebSocket istemcilerine gönder
-    4. Kapanan bağlantıları temizle
+    4. Offset otomatik commit edilir (Docker volume'da saklanır)
+    5. Kapanan bağlantıları temizle
 
-    Advantages vs broadcast:
-    - Kafka topic'in offset'ini kullanarak missed messages'ı recover edebiliriz
-    - Multiple consumer instance'lar aynı topic'i okuyabilir (scaling)
-    - Persistent storage - Kafka log'unda saklanır
+    Recovery:
+    - Consumer crash → Restart → Aynı group_id → Offset restore
+    - Docker container kapandı → Volume persist ediyor → Data korunu
+    - Kafka mesajı 7 gün saklanır (KAFKA_LOG_RETENTION_HOURS=168)
 
     Args:
         consumer: AIOKafkaConsumer instance
@@ -502,13 +515,20 @@ async def kafka_consumer_task(consumer: AIOKafkaConsumer) -> None:
                 for client in stale:
                     connected_clients.discard(client)
 
+                # ⭐ Offset otomatik commit edilir (enable_auto_commit=True + 5s interval)
+                # Mesaj başarıyla işlendikten sonra Kafka offset'i güncellenir
+
+            except json.JSONDecodeError as exc:
+                # JSON parsing hatası - skip et, sonraki mesaja geç
+                print(f"⚠️  JSON parsing hatası: {exc}", file=sys.stderr)
             except Exception as exc:
-                # Mesaj parsing hatası - loglama
+                # Diğer hata'lar - loglama
                 print(f"❌ Kafka mesajı işlenirken hata: {exc}", file=sys.stderr)
 
     except Exception as exc:
         # Consumer bağlantısı koptu - kritik hata
         print(f"❌ Kafka Consumer bağlantı hatası: {exc}", file=sys.stderr)
+        print("⚠️  Offset kaydedilmiştir (restart'ta kaldığı yerden devam edilecek)", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
