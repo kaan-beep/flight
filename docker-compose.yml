@@ -74,11 +74,11 @@ services:
         limits:
           memory: 512M
 
-  app:
+  producer:
     build: .
-    container_name: flight-app
+    container_name: flight-producer
     restart: unless-stopped
-    command: ["python", "app.py"]
+    command: ["python", "producer.py"]
     environment:
       PG_HOST: postgres
       PG_PORT: "5432"
@@ -89,11 +89,27 @@ services:
       KAFKA_TOPIC: flights
       OPENSKY_USERNAME: ${OPENSKY_USERNAME}
       OPENSKY_PASSWORD: ${OPENSKY_PASSWORD}
-    ports:
-      - "8765:8765"
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  consumer:
+    build: .
+    container_name: flight-consumer
+    restart: unless-stopped
+    command: ["python", "consumer.py"]
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_TOPIC: flights
+    ports:
+      - "8765:8765"
+    depends_on:
       kafka:
         condition: service_healthy
     deploy:
