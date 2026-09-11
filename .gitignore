@@ -1,6 +1,27 @@
+# Python
 __pycache__/
-*.pyc
-*.log
-scratch/
+*.py[cod]
+*.egg-info/
+dist/
+build/
 .env
-.claude/
+venv/
+
+# DLQ & Backups
+failed_flights.jsonl
+*.jsonl
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+.env.local
+node_modules/
