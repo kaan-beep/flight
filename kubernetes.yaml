@@ -1,4 +1,14 @@
 ---
+# Flight Radar Kubernetes Deployment
+# Registry: your-registry.azurecr.io
+# Commands:
+#   docker build -t your-registry/flight-producer:latest -f Dockerfile.producer .
+#   docker build -t your-registry/flight-consumer:latest -f Dockerfile.consumer .
+#   docker push your-registry/flight-producer:latest
+#   docker push your-registry/flight-consumer:latest
+#   kubectl apply -f kubernetes.yaml
+
+---
 # Namespace
 apiVersion: v1
 kind: Namespace
@@ -6,23 +16,24 @@ metadata:
   name: flight-radar
 
 ---
-# ConfigMap - Environment Variables
+# ConfigMap - Kafka & App Configuration
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: flight-config
   namespace: flight-radar
 data:
-  PG_HOST: postgres
+  KAFKA_BROKER: "kafka:9092"
+  KAFKA_TOPIC: "flights"
+  PG_HOST: "postgres"
   PG_PORT: "5432"
-  PG_DB: flightradar
-  PG_USER: postgres
-  KAFKA_BROKER: kafka:9092
-  KAFKA_TOPIC: flights
-  WS_PORT: "8765"
+  PG_DB: "flightradar"
+  PG_USER: "postgres"
+  KAFKA_LOG_RETENTION_HOURS: "720"
+  KAFKA_LOG_RETENTION_BYTES: "-1"
 
 ---
-# Secret - Database Password
+# Secret - PostgreSQL Password (Change this!)
 apiVersion: v1
 kind: Secret
 metadata:
@@ -30,19 +41,119 @@ metadata:
   namespace: flight-radar
 type: Opaque
 stringData:
-  PG_PASSWORD: postgres
-  OPENSKY_USERNAME: ""
-  OPENSKY_PASSWORD: ""
+  PG_PASSWORD: "postgres"
+  OPENSKY_USERNAME: "your-opensky-username"
+  OPENSKY_PASSWORD: "your-opensky-password"
 
 ---
-# PostgreSQL StatefulSet
-apiVersion: apps/v1
-kind: StatefulSet
+# PersistentVolume - PostgreSQL Data
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pg-pv
+  namespace: flight-radar
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/pg"
+
+---
+# PersistentVolume - Kafka Data
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kafka-pv
+  namespace: flight-radar
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/kafka"
+
+---
+# PersistentVolume - Zookeeper Data
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: zk-pv
+  namespace: flight-radar
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/data/zookeeper"
+
+---
+# PersistentVolumeClaim - PostgreSQL
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pg-pvc
+  namespace: flight-radar
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# PersistentVolumeClaim - Kafka
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kafka-pvc
+  namespace: flight-radar
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# PersistentVolumeClaim - Zookeeper
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: zk-pvc
+  namespace: flight-radar
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# Service - PostgreSQL
+apiVersion: v1
+kind: Service
 metadata:
   name: postgres
   namespace: flight-radar
 spec:
-  serviceName: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  selector:
+    app: postgres
+
+---
+# Deployment - PostgreSQL
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: flight-radar
+spec:
   replicas: 1
   selector:
     matchLabels:
@@ -74,40 +185,46 @@ spec:
               name: flight-secrets
               key: PG_PASSWORD
         volumeMounts:
-        - name: postgres-data
+        - name: pg-storage
           mountPath: /var/lib/postgresql/data
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "postgres"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
         resources:
           limits:
             memory: "256Mi"
             cpu: "500m"
-      securityContext:
-        fsGroup: 999
-  volumeClaimTemplates:
-  - metadata:
-      name: postgres-data
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      resources:
-        requests:
-          storage: 10Gi
+          requests:
+            memory: "128Mi"
+            cpu: "250m"
+      volumes:
+      - name: pg-storage
+        persistentVolumeClaim:
+          claimName: pg-pvc
 
 ---
-# PostgreSQL Service
+# Service - Zookeeper
 apiVersion: v1
 kind: Service
 metadata:
-  name: postgres
+  name: zookeeper
   namespace: flight-radar
 spec:
-  clusterIP: None
-  selector:
-    app: postgres
   ports:
-  - port: 5432
-    targetPort: 5432
+    - port: 2181
+      targetPort: 2181
+  selector:
+    app: zookeeper
 
 ---
-# Zookeeper Deployment
+# Deployment - Zookeeper
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -134,39 +251,42 @@ spec:
         - name: ZOOKEEPER_TICK_TIME
           value: "2000"
         volumeMounts:
-        - name: zookeeper-data
+        - name: zk-storage
           mountPath: /var/lib/zookeeper/data
         resources:
           limits:
             memory: "128Mi"
-            cpu: "250m"
+            cpu: "200m"
+          requests:
+            memory: "64Mi"
+            cpu: "100m"
       volumes:
-      - name: zookeeper-data
-        emptyDir: {}
+      - name: zk-storage
+        persistentVolumeClaim:
+          claimName: zk-pvc
 
 ---
-# Zookeeper Service
+# Service - Kafka
 apiVersion: v1
 kind: Service
-metadata:
-  name: zookeeper
-  namespace: flight-radar
-spec:
-  selector:
-    app: zookeeper
-  ports:
-  - port: 2181
-    targetPort: 2181
-
----
-# Kafka StatefulSet
-apiVersion: apps/v1
-kind: StatefulSet
 metadata:
   name: kafka
   namespace: flight-radar
 spec:
-  serviceName: kafka
+  ports:
+    - port: 9092
+      targetPort: 9092
+  selector:
+    app: kafka
+
+---
+# Deployment - Kafka
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka
+  namespace: flight-radar
+spec:
   replicas: 1
   selector:
     matchLabels:
@@ -197,46 +317,46 @@ spec:
         - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
           value: "true"
         - name: KAFKA_LOG_RETENTION_HOURS
-          value: "720"
+          valueFrom:
+            configMapKeyRef:
+              name: flight-config
+              key: KAFKA_LOG_RETENTION_HOURS
         - name: KAFKA_LOG_RETENTION_BYTES
-          value: "-1"
+          valueFrom:
+            configMapKeyRef:
+              name: flight-config
+              key: KAFKA_LOG_RETENTION_BYTES
         - name: KAFKA_NUM_NETWORK_THREADS
           value: "8"
         - name: KAFKA_NUM_IO_THREADS
           value: "8"
         volumeMounts:
-        - name: kafka-data
+        - name: kafka-storage
           mountPath: /var/lib/kafka/data
+        livenessProbe:
+          exec:
+            command: ["kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+          initialDelaySeconds: 60
+          periodSeconds: 15
+        readinessProbe:
+          exec:
+            command: ["kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
         resources:
           limits:
             memory: "512Mi"
             cpu: "1000m"
-  volumeClaimTemplates:
-  - metadata:
-      name: kafka-data
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      resources:
-        requests:
-          storage: 20Gi
+          requests:
+            memory: "256Mi"
+            cpu: "500m"
+      volumes:
+      - name: kafka-storage
+        persistentVolumeClaim:
+          claimName: kafka-pvc
 
 ---
-# Kafka Service
-apiVersion: v1
-kind: Service
-metadata:
-  name: kafka
-  namespace: flight-radar
-spec:
-  clusterIP: None
-  selector:
-    app: kafka
-  ports:
-  - port: 9092
-    targetPort: 9092
-
----
-# Producer Deployment
+# Deployment - Producer
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -254,13 +374,23 @@ spec:
     spec:
       containers:
       - name: producer
-        image: flight-radar-producer:latest
-        imagePullPolicy: Never
+        image: your-registry.azurecr.io/flight-producer:latest
+        imagePullPolicy: Always
         envFrom:
         - configMapRef:
             name: flight-config
         - secretRef:
             name: flight-secrets
+        livenessProbe:
+          exec:
+            command: ["python", "-c", "import socket; socket.create_connection(('kafka', 9092), timeout=5)"]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command: ["python", "-c", "import socket; socket.create_connection(('kafka', 9092), timeout=5)"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
         resources:
           limits:
             memory: "256Mi"
@@ -268,10 +398,11 @@ spec:
           requests:
             memory: "128Mi"
             cpu: "250m"
-      restartPolicy: Always
+      imagePullSecrets:
+      - name: registry-credentials
 
 ---
-# Consumer Deployment
+# Deployment - Consumer
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -289,13 +420,24 @@ spec:
     spec:
       containers:
       - name: consumer
-        image: flight-radar-consumer:latest
-        imagePullPolicy: Never
+        image: your-registry.azurecr.io/flight-consumer:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8765
+          name: websocket
         envFrom:
         - configMapRef:
             name: flight-config
+        livenessProbe:
+          exec:
+            command: ["python", "-c", "import socket; socket.create_connection(('localhost', 8765), timeout=5)"]
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command: ["python", "-c", "import socket; socket.create_connection(('localhost', 8765), timeout=5)"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
         resources:
           limits:
             memory: "256Mi"
@@ -303,10 +445,11 @@ spec:
           requests:
             memory: "128Mi"
             cpu: "250m"
-      restartPolicy: Always
+      imagePullSecrets:
+      - name: registry-credentials
 
 ---
-# Consumer Service (WebSocket)
+# Service - Consumer (WebSocket)
 apiVersion: v1
 kind: Service
 metadata:
@@ -314,9 +457,9 @@ metadata:
   namespace: flight-radar
 spec:
   type: NodePort
+  ports:
+    - port: 8765
+      targetPort: 8765
+      nodePort: 30765
   selector:
     app: consumer
-  ports:
-  - port: 8765
-    targetPort: 8765
-    nodePort: 30765
