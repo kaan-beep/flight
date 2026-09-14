@@ -20,15 +20,15 @@ from aiokafka import AIOKafkaProducer
 
 # OpenSky Network API
 OPENSKY_URL = "https://opensky-network.org/api/states/all"
-POLL_INTERVAL_SECONDS = 25
+POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "25"))
 RATE_LIMIT_BACKOFF_SECONDS = 120
 
 # Kafka
 KAFKA_BROKER = os.getenv("KAFKA_BROKER", "localhost:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "flights")
 
-# Coğrafi sınır - Türkiye + komşu ülkeler
-REGION_BBOX = (25.0, -12.0, 60.0, 55.0)
+# Coğrafi sınır "lamin,lomin,lamax,lomax" - varsayılan Türkiye + komşu ülkeler
+REGION_BBOX = tuple(float(x) for x in os.getenv("REGION_BBOX", "25.0,-12.0,60.0,55.0").split(","))
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS flight_states (

@@ -31,6 +31,9 @@ data:
   PG_USER: "postgres"
   KAFKA_LOG_RETENTION_HOURS: "720"
   KAFKA_LOG_RETENTION_BYTES: "-1"
+  # Kucuk makine: sadece Turkiye (~300-600 ucak), 60s'de bir
+  REGION_BBOX: "35.8,25.6,42.1,44.8"
+  POLL_INTERVAL_SECONDS: "60"
 
 ---
 # Secret - PostgreSQL Password (Change this!)
@@ -155,6 +158,8 @@ metadata:
   namespace: flight-radar
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: postgres
@@ -163,6 +168,7 @@ spec:
       labels:
         app: postgres
     spec:
+      enableServiceLinks: false
       containers:
       - name: postgres
         image: postgres:16
@@ -199,10 +205,10 @@ spec:
           periodSeconds: 5
         resources:
           limits:
-            memory: "256Mi"
+            memory: "192Mi"
             cpu: "500m"
           requests:
-            memory: "128Mi"
+            memory: "96Mi"
             cpu: "50m"
       volumes:
       - name: pg-storage
@@ -232,6 +238,8 @@ metadata:
   namespace: flight-radar
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: zookeeper
@@ -240,6 +248,7 @@ spec:
       labels:
         app: zookeeper
     spec:
+      enableServiceLinks: false
       containers:
       - name: zookeeper
         image: confluentinc/cp-zookeeper:7.5.0
@@ -250,15 +259,17 @@ spec:
           value: "2181"
         - name: ZOOKEEPER_TICK_TIME
           value: "2000"
+        - name: KAFKA_HEAP_OPTS
+          value: "-Xmx128M -Xms64M"
         volumeMounts:
         - name: zk-storage
           mountPath: /var/lib/zookeeper/data
         resources:
           limits:
-            memory: "128Mi"
+            memory: "192Mi"
             cpu: "200m"
           requests:
-            memory: "64Mi"
+            memory: "96Mi"
             cpu: "50m"
       volumes:
       - name: zk-storage
@@ -274,8 +285,12 @@ metadata:
   namespace: flight-radar
 spec:
   ports:
-    - port: 9092
+    - name: client
+      port: 9092
       targetPort: 9092
+    - name: internal
+      port: 29092
+      targetPort: 29092
   selector:
     app: kafka
 
@@ -288,6 +303,8 @@ metadata:
   namespace: flight-radar
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: kafka
@@ -296,6 +313,7 @@ spec:
       labels:
         app: kafka
     spec:
+      enableServiceLinks: false
       containers:
       - name: kafka
         image: confluentinc/cp-kafka:7.5.0
@@ -327,25 +345,31 @@ spec:
               name: flight-config
               key: KAFKA_LOG_RETENTION_BYTES
         - name: KAFKA_NUM_NETWORK_THREADS
-          value: "8"
+          value: "2"
         - name: KAFKA_NUM_IO_THREADS
-          value: "8"
+          value: "2"
+        - name: KAFKA_HEAP_OPTS
+          value: "-Xmx256M -Xms128M"
         volumeMounts:
         - name: kafka-storage
           mountPath: /var/lib/kafka/data
         livenessProbe:
-          exec:
-            command: ["kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-          initialDelaySeconds: 60
-          periodSeconds: 15
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 180
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 6
         readinessProbe:
-          exec:
-            command: ["kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
-          initialDelaySeconds: 30
+          tcpSocket:
+            port: 9092
+          initialDelaySeconds: 45
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12
         resources:
           limits:
-            memory: "512Mi"
+            memory: "448Mi"
             cpu: "1000m"
           requests:
             memory: "256Mi"
@@ -372,31 +396,22 @@ spec:
       labels:
         app: producer
     spec:
+      enableServiceLinks: false
       containers:
       - name: producer
         image: flight-producer:local
-        imagePullPolicy: Never
+        imagePullPolicy: IfNotPresent
         envFrom:
         - configMapRef:
             name: flight-config
         - secretRef:
             name: flight-secrets
-        livenessProbe:
-          exec:
-            command: ["python", "-c", "import socket; socket.create_connection(('kafka', 9092), timeout=5)"]
-          initialDelaySeconds: 60
-          periodSeconds: 30
-        readinessProbe:
-          exec:
-            command: ["python", "-c", "import socket; socket.create_connection(('kafka', 9092), timeout=5)"]
-          initialDelaySeconds: 30
-          periodSeconds: 10
         resources:
           limits:
-            memory: "256Mi"
+            memory: "160Mi"
             cpu: "500m"
           requests:
-            memory: "128Mi"
+            memory: "64Mi"
             cpu: "50m"
 
 ---
@@ -416,10 +431,11 @@ spec:
       labels:
         app: consumer
     spec:
+      enableServiceLinks: false
       containers:
       - name: consumer
         image: flight-consumer:local
-        imagePullPolicy: Never
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8765
           name: websocket
@@ -427,21 +443,22 @@ spec:
         - configMapRef:
             name: flight-config
         livenessProbe:
-          exec:
-            command: ["python", "-c", "import socket; socket.create_connection(('localhost', 8765), timeout=5)"]
-          initialDelaySeconds: 60
+          tcpSocket:
+            port: 8765
+          initialDelaySeconds: 120
           periodSeconds: 30
+          failureThreshold: 5
         readinessProbe:
-          exec:
-            command: ["python", "-c", "import socket; socket.create_connection(('localhost', 8765), timeout=5)"]
-          initialDelaySeconds: 30
+          tcpSocket:
+            port: 8765
+          initialDelaySeconds: 20
           periodSeconds: 10
         resources:
           limits:
-            memory: "256Mi"
+            memory: "128Mi"
             cpu: "500m"
           requests:
-            memory: "128Mi"
+            memory: "64Mi"
             cpu: "50m"
 
 ---
