@@ -77,7 +77,9 @@ services:
           memory: 512M
 
   producer:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.producer
     container_name: flight-producer
     restart: unless-stopped
     command: ["python", "producer.py"]
@@ -102,7 +104,9 @@ services:
           memory: 256M
 
   consumer:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.consumer
     container_name: flight-consumer
     restart: unless-stopped
     command: ["python", "consumer.py"]

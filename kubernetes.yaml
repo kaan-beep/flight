@@ -203,7 +203,7 @@ spec:
             cpu: "500m"
           requests:
             memory: "128Mi"
-            cpu: "250m"
+            cpu: "50m"
       volumes:
       - name: pg-storage
         persistentVolumeClaim:
@@ -259,7 +259,7 @@ spec:
             cpu: "200m"
           requests:
             memory: "64Mi"
-            cpu: "100m"
+            cpu: "50m"
       volumes:
       - name: zk-storage
         persistentVolumeClaim:
@@ -349,7 +349,7 @@ spec:
             cpu: "1000m"
           requests:
             memory: "256Mi"
-            cpu: "500m"
+            cpu: "200m"
       volumes:
       - name: kafka-storage
         persistentVolumeClaim:
@@ -374,8 +374,8 @@ spec:
     spec:
       containers:
       - name: producer
-        image: your-registry.azurecr.io/flight-producer:latest
-        imagePullPolicy: Always
+        image: flight-producer:local
+        imagePullPolicy: Never
         envFrom:
         - configMapRef:
             name: flight-config
@@ -397,9 +397,7 @@ spec:
             cpu: "500m"
           requests:
             memory: "128Mi"
-            cpu: "250m"
-      imagePullSecrets:
-      - name: registry-credentials
+            cpu: "50m"
 
 ---
 # Deployment - Consumer
@@ -420,8 +418,8 @@ spec:
     spec:
       containers:
       - name: consumer
-        image: your-registry.azurecr.io/flight-consumer:latest
-        imagePullPolicy: Always
+        image: flight-consumer:local
+        imagePullPolicy: Never
         ports:
         - containerPort: 8765
           name: websocket
@@ -444,9 +442,7 @@ spec:
             cpu: "500m"
           requests:
             memory: "128Mi"
-            cpu: "250m"
-      imagePullSecrets:
-      - name: registry-credentials
+            cpu: "50m"
 
 ---
 # Service - Consumer (WebSocket)

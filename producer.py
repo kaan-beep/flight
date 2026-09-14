@@ -190,7 +190,7 @@ async def produce_to_kafka(producer, flights, max_retries=3, retry_delay=2):
         # Retry loop - max 3 kez deneme
         for attempt in range(1, max_retries + 1):
             try:
-                await producer.send_and_wait(KAFKA_TOPIC, message, timeout_ms=10000)
+                await asyncio.wait_for(producer.send_and_wait(KAFKA_TOPIC, message), timeout=10)
                 success = True
                 break  # Başarılı, sonraki flight'a geç
 
@@ -241,7 +241,7 @@ async def retry_failed_flights(producer, max_retries=3):
                     message = json.dumps(flight).encode("utf-8")
 
                     # Retry Kafka yazma
-                    await producer.send_and_wait(KAFKA_TOPIC, message, timeout_ms=10000)
+                    await asyncio.wait_for(producer.send_and_wait(KAFKA_TOPIC, message), timeout=10)
                     successful.append(entry)
                     retry_count += 1
                     print(f"✅ Başarısız flight retry başarılı: {flight['icao24']}")
